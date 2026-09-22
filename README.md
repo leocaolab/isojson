@@ -16,6 +16,13 @@ ImportError: module orjson.orjson does not support loading in subinterpreters
 >>> interpreters.create().exec("import isojson")   # works, strict mode, no override
 ```
 
+```bash
+pip install isojson
+```
+
+Wheels are published for CPython 3.12, 3.13 and 3.14 on Linux (x86_64,
+aarch64), macOS (arm64, x86_64) and Windows (x86_64).
+
 ```python
 import isojson
 
@@ -344,8 +351,7 @@ The suite passes on macOS arm64 and Linux x86_64, both normally and under
 ## Status
 
 Version 0.1.0. The API is stable (it is orjson's). Native `datetime`, `UUID`,
-`Enum`, and dataclass support is next. Not yet published on PyPI. Build from
-source with `maturin`.
+`Enum`, and dataclass support is next.
 
 ## License
 
