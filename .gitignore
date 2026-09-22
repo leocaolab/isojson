@@ -1,0 +1,7 @@
+target/
+.venv/
+__pycache__/
+*.so
+*.pyc
+.pytest_cache/
+dist/
