@@ -311,6 +311,53 @@ the input is copied (simd-json unescapes in place, and `bytes` are
 immutable), and a fresh tape is allocated on every call. Both are next on
 the list.
 
+### Linux x86_64: AMD Ryzen 7 7840HS, 8 cores / 16 threads, CPython 3.14.7, orjson 3.12.0
+
+Run on a shared box with light background load (1-minute load average 6.0 at
+the start, 3.9 at the end).
+
+| setup | N=1 | N=2 | N=4 | N=8 | scaling 1→8 |
+|---|---:|---:|---:|---:|---:|
+| **isojson, N own-GIL sub-interpreters, one process** | 14,129 | 27,887 | 54,893 | **78,242** | **5.54×** |
+| json (stdlib), N own-GIL sub-interpreters | 3,862 | 7,677 | 15,154 | 19,973 | 5.17× |
+| orjson, N own-GIL sub-interpreters | ✗ | ✗ | ✗ | ✗ | — |
+| orjson, N threads, one interpreter (shared GIL) | 19,934 | 18,492 | 17,668 | 17,537 | 0.88× |
+| isojson, N threads, one interpreter (shared GIL) | 13,890 | 12,388 | 13,034 | 12,301 | 0.89× |
+| orjson, N processes (multiprocessing) | 19,651 | 38,657 | 74,130 | 98,140 | 4.99× |
+| isojson, N processes (multiprocessing) | 14,122 | 27,388 | 54,055 | 75,194 | 5.32× |
+
+Here isojson on 8 sub-interpreters does **3.9×** the best orjson manages in
+one process, and **3.9×** stdlib `json` on the same sub-interpreters. It
+matches isojson on 8 processes (78k vs 75k). orjson on 8 processes is again
+the fastest row (98k).
+
+| `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
+|---|---:|---:|---:|---:|
+| small (27 B) | 78 ns | 79 ns | 933 ns | 0.99× |
+| records ×100 | 27.25 µs | 19.83 µs | 171.77 µs | 1.37× |
+| records ×2000 | 736.39 µs | 382.51 µs | 3.99 ms | 1.93× |
+| floats ×10k | 180.59 µs | 183.01 µs | 3.23 ms | 0.99× |
+| unicode/escapes ×200 | 16.93 µs | 13.93 µs | 107.23 µs | 1.22× |
+
+| `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
+|---|---:|---:|---:|---:|
+| small (27 B) | 146 ns | 128 ns | 948 ns | 1.13× |
+| records ×100 | 78.60 µs | 54.66 µs | 151.23 µs | 1.44× |
+| records ×2000 | 1.67 ms | 1.17 ms | 3.10 ms | 1.42× |
+| floats ×10k | 300.53 µs | 188.56 µs | 1.58 ms | 1.59× |
+| unicode/escapes ×200 | 87.24 µs | 54.87 µs | 164.43 µs | 1.59× |
+
+Per call, x86_64 is harder on isojson than arm64. `dumps` of large record
+documents is 1.9× slower than orjson here, against 1.2× on the Mac, and `loads`
+is 1.1–1.6× slower. Both are still 1.9–18× faster than stdlib `json`.
+
+### Across both machines
+
+On 8 own-GIL sub-interpreters in one process, isojson does **4–5×** the best
+orjson can do in a single process (3.9× on Linux x86_64, 5.3× on macOS arm64),
+and about 4× stdlib `json`. orjson on multiprocessing stays faster per core on
+both.
+
 ## Testing
 
 ```bash
