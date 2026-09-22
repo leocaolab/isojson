@@ -87,7 +87,7 @@ impl KeyCache {
 unsafe fn new_ascii(b: &[u8]) -> R<*mut PyObject> {
     let o = PyUnicode_New(b.len() as Py_ssize_t, 127);
     if o.is_null() {
-        return Err(Error::Python);
+        return Err(Fail);
     }
     ptr::copy_nonoverlapping(b.as_ptr(), PyUnicode_DATA(o).cast::<u8>(), b.len());
     Ok(o)
@@ -96,17 +96,23 @@ unsafe fn new_ascii(b: &[u8]) -> R<*mut PyObject> {
 /// orjson: 1024 nested containers ok, 1025 fails.
 const MAX_DEPTH: usize = 1024;
 
-enum Error {
-    /// JSON syntax error: message + byte offset into the input.
-    Syntax(String, usize),
-    /// A Python exception is already set (e.g. MemoryError).
-    Python,
+/// Parse failure marker. It is zero-sized on purpose: every value parsed
+/// returns `R<*mut PyObject>`, and a small `Result` travels in registers.
+/// Details of a *syntax* error are stashed in `SYNTAX` (plain data, never a
+/// Python object); if `SYNTAX` is empty, a Python exception is already set.
+struct Fail;
+
+type R<T> = Result<T, Fail>;
+
+thread_local! {
+    static SYNTAX: core::cell::Cell<Option<(&'static str, usize)>> = const { core::cell::Cell::new(None) };
 }
 
-type R<T> = Result<T, Error>;
-
-fn syntax<T>(msg: impl Into<String>, pos: usize) -> R<T> {
-    Err(Error::Syntax(msg.into(), pos))
+#[cold]
+#[inline(never)]
+fn syntax<T>(msg: &'static str, pos: usize) -> R<T> {
+    SYNTAX.set(Some((msg, pos)));
+    Err(Fail)
 }
 
 enum Frame {
@@ -166,17 +172,24 @@ fn is_ws(b: u8) -> bool {
 #[inline]
 unsafe fn new_ref(p: *mut PyObject) -> R<*mut PyObject> {
     if p.is_null() {
-        Err(Error::Python)
+        Err(Fail)
     } else {
         Ok(p)
     }
 }
 
 impl<'a> Parser<'a> {
-    #[inline]
+    #[inline(always)]
     fn skip_ws(&mut self) {
-        while self.i < self.s.len() && is_ws(self.s[self.i]) {
-            self.i += 1;
+        // Common case: the next byte is not whitespace (every whitespace
+        // byte is <= b' ').
+        match self.s.get(self.i) {
+            Some(&b) if b > b' ' => {}
+            _ => {
+                while self.i < self.s.len() && is_ws(self.s[self.i]) {
+                    self.i += 1;
+                }
+            }
         }
     }
 
@@ -280,7 +293,7 @@ impl<'a> Parser<'a> {
                         Py_DECREF(*k);
                         *k = ptr::null_mut();
                         if rc < 0 {
-                            return Err(Error::Python);
+                            return Err(Fail);
                         }
                         self.skip_ws();
                         match self.peek() {
@@ -337,13 +350,21 @@ impl<'a> Parser<'a> {
         Ok(k)
     }
 
-    unsafe fn literal(&mut self, word: &[u8], obj: *mut PyObject) -> R<*mut PyObject> {
-        if self.s[self.i..].starts_with(word) {
-            self.i += word.len();
-            Py_INCREF(obj);
-            Ok(obj)
-        } else {
-            syntax("unexpected character, expected a JSON value", self.i)
+    /// `true` / `false` / `null`. `N` is a compile-time length, so the
+    /// comparison is a single integer compare, not a `memcmp` call.
+    #[inline]
+    unsafe fn literal<const N: usize>(
+        &mut self,
+        word: &[u8; N],
+        obj: *mut PyObject,
+    ) -> R<*mut PyObject> {
+        match self.s.get(self.i..self.i + N) {
+            Some(w) if w == word => {
+                self.i += N;
+                Py_INCREF(obj);
+                Ok(obj)
+            }
+            _ => syntax("unexpected character, expected a JSON value", self.i),
         }
     }
 
@@ -401,15 +422,15 @@ impl<'a> Parser<'a> {
                         b'r' => buf.push(b'\r'),
                         b't' => buf.push(b'\t'),
                         b'u' => {
-                            let hi = hex4(s, j)
-                                .ok_or(Error::Syntax("invalid \\u escape".into(), esc))?;
+                            let hi =
+                                hex4(s, j).map_or_else(|| syntax("invalid \\u escape", esc), Ok)?;
                             j += 4;
                             let cp = if (0xD800..0xDC00).contains(&hi) {
                                 if s.get(j) != Some(&b'\\') || s.get(j + 1) != Some(&b'u') {
                                     return syntax("no low surrogate in string", esc);
                                 }
                                 let lo = hex4(s, j + 2)
-                                    .ok_or(Error::Syntax("invalid \\u escape".into(), j))?;
+                                    .map_or_else(|| syntax("invalid \\u escape", j), Ok)?;
                                 if !(0xDC00..0xE000).contains(&lo) {
                                     return syntax("no low surrogate in string", esc);
                                 }
@@ -421,7 +442,7 @@ impl<'a> Parser<'a> {
                                 hi
                             };
                             let ch = char::from_u32(cp)
-                                .ok_or(Error::Syntax("invalid \\u escape".into(), esc))?;
+                                .map_or_else(|| syntax("invalid \\u escape", esc), Ok)?;
                             let mut tmp = [0u8; 4];
                             buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
                         }
@@ -439,60 +460,139 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One pass: validate the JSON number grammar and accumulate the
+    /// significand at the same time.
     unsafe fn number(&mut self) -> R<*mut PyObject> {
         let s = self.s;
+        let n = s.len();
         let st = self.i;
         let mut j = st;
         let neg = s[j] == b'-';
         if neg {
             j += 1;
         }
-        match s.get(j) {
-            Some(b'0') => j += 1,
-            Some(b'1'..=b'9') => {
-                while matches!(s.get(j), Some(b'0'..=b'9')) {
-                    j += 1;
+        let mut w: u64 = 0;
+        let mut sig: u32 = 0; // significant digits held in `w`
+        let mut many = false; // a digit was dropped past 19 significant
+        let mut q: i64 = 0; // decimal exponent adjustment
+
+        // integer part
+        let int_start = j;
+        if j < n && s[j] == b'0' {
+            j += 1;
+        } else {
+            // first digit is 1-9 in valid JSON, so w != 0 from here on and
+            // every further digit is significant
+            if j < n && s[j].wrapping_sub(b'1') < 9 {
+                w = (s[j] - b'0') as u64;
+                sig = 1;
+                j += 1;
+                while sig <= 11 && j + 8 <= n {
+                    let v = swar::load(s, j);
+                    if !swar::is_8digits(v) {
+                        break;
+                    }
+                    w = w * 100_000_000 + swar::parse_8digits(v);
+                    sig += 8;
+                    j += 8;
+                }
+                if sig <= 15 && j + 4 <= n && swar::is_4digits(swar::load4(s, j)) {
+                    w = w * 10_000 + swar::parse_4digits(swar::load4(s, j));
+                    sig += 4;
+                    j += 4;
                 }
             }
-            _ => return syntax("invalid number", st),
-        }
-        let mut is_float = false;
-        if s.get(j) == Some(&b'.') {
-            j += 1;
-            if !matches!(s.get(j), Some(b'0'..=b'9')) {
+            while j < n && s[j].wrapping_sub(b'0') < 10 {
+                let d = (s[j] - b'0') as u64;
+                if sig < 19 {
+                    w = w * 10 + d;
+                    if w != 0 {
+                        sig += 1;
+                    }
+                } else {
+                    many |= d != 0 || many;
+                    q += 1;
+                }
+                j += 1;
+            }
+            if j == int_start {
                 return syntax("invalid number", st);
             }
-            while matches!(s.get(j), Some(b'0'..=b'9')) {
+        }
+        let int_digits = j - int_start;
+
+        let mut is_float = false;
+        if j < n && s[j] == b'.' {
+            j += 1;
+            let frac_start = j;
+            // 8 digits at a time while w already has a significant digit
+            // (so every digit counts) and 19 significant digits won't overflow
+            if w != 0 {
+                while sig <= 11 && j + 8 <= n {
+                    let v = swar::load(s, j);
+                    if !swar::is_8digits(v) {
+                        break;
+                    }
+                    w = w * 100_000_000 + swar::parse_8digits(v);
+                    sig += 8;
+                    q -= 8;
+                    j += 8;
+                }
+                if sig <= 15 && j + 4 <= n && swar::is_4digits(swar::load4(s, j)) {
+                    w = w * 10_000 + swar::parse_4digits(swar::load4(s, j));
+                    sig += 4;
+                    q -= 4;
+                    j += 4;
+                }
+            }
+            while j < n && s[j].wrapping_sub(b'0') < 10 {
+                let d = (s[j] - b'0') as u64;
+                if sig < 19 {
+                    w = w * 10 + d;
+                    if w != 0 {
+                        sig += 1;
+                    }
+                    q -= 1;
+                } else {
+                    many |= d != 0;
+                }
                 j += 1;
+            }
+            if j == frac_start {
+                return syntax("invalid number", st);
             }
             is_float = true;
         }
-        if matches!(s.get(j), Some(b'e' | b'E')) {
+        if j < n && (s[j] | 0x20) == b'e' {
             j += 1;
-            if matches!(s.get(j), Some(b'+' | b'-')) {
+            let eneg = j < n && s[j] == b'-';
+            if j < n && (s[j] == b'+' || s[j] == b'-') {
                 j += 1;
             }
-            if !matches!(s.get(j), Some(b'0'..=b'9')) {
+            let exp_start = j;
+            let mut e: i64 = 0;
+            while j < n && s[j].wrapping_sub(b'0') < 10 {
+                if e < 0x1_0000 {
+                    e = e * 10 + (s[j] - b'0') as i64;
+                }
+                j += 1;
+            }
+            if j == exp_start {
                 return syntax("invalid number", st);
             }
-            while matches!(s.get(j), Some(b'0'..=b'9')) {
-                j += 1;
-            }
+            q += if eneg { -e } else { e };
             is_float = true;
         }
         self.i = j;
-        // SAFETY: the grammar above admits only ASCII.
-        let text = core::str::from_utf8_unchecked(&s[st..j]);
+
         if !is_float {
-            // Up to 18 digits always fits in i64: accumulate directly.
-            let digits = if neg { &s[st + 1..j] } else { &s[st..j] };
-            if digits.len() <= 18 {
-                let mut v: i64 = 0;
-                for &b in digits {
-                    v = v * 10 + (b - b'0') as i64;
-                }
+            // up to 18 digits always fits in i64 (leading zeros are
+            // impossible: JSON forbids them)
+            if int_digits <= 18 {
+                let v = w as i64;
                 return new_ref(PyLong_FromLongLong(if neg { -v } else { v }));
             }
+            let text = core::str::from_utf8_unchecked(&s[st..j]);
             if let Ok(v) = text.parse::<i64>() {
                 return new_ref(PyLong_FromLongLong(v));
             }
@@ -501,10 +601,22 @@ impl<'a> Parser<'a> {
             }
             // Beyond 64 bits: orjson returns a float, and so do we.
         }
-        match fast_float2::parse::<f64, _>(text) {
-            Ok(v) if v.is_finite() => new_ref(PyFloat_FromDouble(v)),
-            _ => syntax("number is infinity when parsed as double", st),
+        let d = crate::number::Decimal { neg, w, q, many };
+        let v = match crate::number::to_f64(&d) {
+            Some(v) => v,
+            None => {
+                // SAFETY: the grammar above admits only ASCII.
+                let text = core::str::from_utf8_unchecked(&s[st..j]);
+                match fast_float2::parse::<f64, _>(text) {
+                    Ok(v) => v,
+                    Err(_) => return syntax("invalid number", st),
+                }
+            }
+        };
+        if !v.is_finite() {
+            return syntax("number is infinity when parsed as double", st);
         }
+        new_ref(PyFloat_FromDouble(v))
     }
 }
 
@@ -518,7 +630,7 @@ unsafe fn make_str(bytes: &[u8], pos: usize) -> R<*mut PyObject> {
             PyErr_Clear();
             return syntax("str is not valid UTF-8: surrogates not allowed", pos);
         }
-        return Err(Error::Python);
+        return Err(Fail);
     }
     Ok(o)
 }
@@ -528,7 +640,7 @@ unsafe fn build_list(items: &mut Vec<*mut PyObject>, start: usize) -> R<*mut PyO
     let n = items.len() - start;
     let l = PyList_New(n as Py_ssize_t);
     if l.is_null() {
-        return Err(Error::Python); // items stay owned by the stack, released on drop
+        return Err(Fail); // items stay owned by the stack, released on drop
     }
     for (i, &o) in items[start..].iter().enumerate() {
         PyList_SET_ITEM(l, i as Py_ssize_t, o); // steals
@@ -605,11 +717,13 @@ unsafe fn run(module: *mut PyObject, input: &[u8], doc: *mut PyObject) -> *mut P
         scratch: Vec::new(),
         keys: (*state(module)).key_cache,
     };
+    SYNTAX.set(None);
     match p.parse() {
         Ok(o) => o,
-        Err(Error::Python) => ptr::null_mut(),
-        Err(Error::Syntax(msg, pos)) => {
-            raise_decode_error(module, &msg, input, doc, pos);
+        Err(Fail) => {
+            if let Some((msg, pos)) = SYNTAX.take() {
+                raise_decode_error(module, msg, input, doc, pos);
+            }
             ptr::null_mut()
         }
     }

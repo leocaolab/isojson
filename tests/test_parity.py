@@ -281,3 +281,43 @@ def test_decode_error_position():
         assert e.pos == 12 and e.lineno == 1 and e.colno == 13
     else:
         raise AssertionError
+
+
+def test_loads_float_text_correctly_rounded():
+    """The hand-rolled parser (Clinger fast path + Eisel-Lemire + fallback)
+    must round every decimal exactly like CPython's float(), which is
+    correctly rounded."""
+    r = random.Random(99)
+    docs = []
+    for _ in range(200_000):
+        nd = r.randrange(1, 41)
+        digits = "".join(r.choice("0123456789") for _ in range(nd)).lstrip("0") or "0"
+        cut = r.randrange(0, len(digits) + 1)
+        intp, frac = digits[:cut] or "0", digits[cut:]
+        s = intp + ("." + frac if frac else ".0")
+        if r.random() < 0.6:
+            s += r.choice("eE") + r.choice(["", "+", "-"]) + str(r.randrange(0, 330))
+        if r.random() < 0.5:
+            s = "-" + s
+        docs.append(s)
+    # halfway / boundary / subnormal cases
+    docs += [
+        "9007199254740993.0", "9007199254740992.5", "2.2250738585072011e-308",
+        "2.2250738585072012e-308", "4.9406564584124654e-324", "2.4703282292062327e-324",
+        "2.4703282292062328e-324", "1.7976931348623157e308", "1.7976931348623158e308",
+        "0.1000000000000000055511151231257827021181583404541015625",
+        "0.1000000000000000055511151231257827021181583404541015624",
+        "123456789012345678901234567890e-10", "1e-400", "-1e-400", "0.0e0", "-0.0",
+        "7.2057594037927933e16", "3.0540412816652643e-5", "1e23", "8.98846567431158e307",
+    ]
+    for s in docs:
+        try:
+            expect = float(s)
+        except OverflowError:
+            continue
+        if expect in (float("inf"), float("-inf")):
+            with pytest.raises(isojson.JSONDecodeError):
+                isojson.loads(s)
+            continue
+        got = isojson.loads(s)
+        assert type(got) is float and struct.pack("<d", got) == struct.pack("<d", expect), (s, got, expect)

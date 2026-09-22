@@ -18,6 +18,7 @@ compile_error!("isojson does not support Python 3.15 yet (PyModExport init is no
 mod decode;
 mod encode;
 mod float;
+mod number;
 mod swar;
 
 use core::ffi::{c_int, c_void};
