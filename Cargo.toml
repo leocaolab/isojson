@@ -16,7 +16,7 @@ crate-type = ["cdylib"]
 pyo3-ffi = "0.29"
 itoa = "1"
 zmij = "1.0.23"
-fast-float2 = "0.2.4"
+simd-json = { version = "0.18", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] }
 
 [build-dependencies]
 pyo3-build-config = "0.29"
@@ -25,3 +25,9 @@ pyo3-build-config = "0.29"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# simd-json 0.18.1 with the lone-high-surrogate fix (upstream PR pending):
+# "\ud800" parsed as "\0" instead of an error. Pinned by commit; drop this
+# once a simd-json release contains the fix.
+[patch.crates-io]
+simd-json = { git = "https://github.com/leocaolab/simd-json", rev = "0e253fb" }

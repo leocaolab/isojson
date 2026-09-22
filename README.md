@@ -79,8 +79,14 @@ requirements.
   also held by a reference for that span.
 - **Exceptions belong to the interpreter.** `isojson.JSONDecodeError`
   subclasses the calling interpreter's own `json.JSONDecodeError`.
-- **The parser uses no recursion.** `loads` keeps nesting on a heap stack, so
-  a document nested 1024 deep is safe even on threads with small C stacks.
+- **Parsing is done by simd-json, with no recursion.** `loads` uses
+  [simd-json](https://github.com/simd-lite/simd-json) (a pure-Rust port of
+  simdjson) to build a flat tape of the document. It then builds Python
+  objects from the tape, using an explicit stack. A document nested 1024
+  deep is safe even on threads with small C stacks; deeper documents are
+  rejected, as in orjson. simd-json never touches a Python object. isojson
+  currently pins a simd-json commit that fixes a lone-surrogate bug (see
+  `Cargo.toml`) until that fix is released upstream.
 - **No PyO3.** The module is written against the raw C API (`pyo3-ffi`).
   PyO3's high-level layer caches type objects and modules in process-global
   statics and rejects a second interpreter, which is the problem this package
@@ -220,6 +226,11 @@ pytest tests
   - error types and messages for every `dumps` failure mode;
   - the recursion and `default` depth limits;
   - `loads` accept/reject behaviour on edge-case documents.
+- **JSON conformance** (`tests/test_conformance.py`): all 318 cases of
+  [JSONTestSuite](https://github.com/nst/JSONTestSuite). Every must-accept
+  document parses, every must-reject document raises `JSONDecodeError`, and
+  nothing crashes. The suite runs in a child process, so a crash is reported
+  as a failure.
 - **Multi-interpreter safety** (`tests/test_subinterp.py`):
   - strict import in 6 own-GIL sub-interpreters with no override;
   - per-interpreter module state and exception types;
