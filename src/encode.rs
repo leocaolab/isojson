@@ -9,17 +9,15 @@
 use core::ffi::CStr;
 use core::ptr;
 use pyo3_ffi::*;
-use std::cell::Cell;
 
 use crate::float::write_f64;
+use crate::out::Out;
 use crate::*;
 
 /// Nested containers at or beyond this depth fail (orjson: 254 ok, 255 fails).
 const MAX_DEPTH: u32 = 254;
 /// Chained `default` calls allowed before giving up (orjson: 255).
 const MAX_DEFAULT_DEPTH: u32 = 255;
-/// Buffers larger than this are not kept for reuse.
-const KEEP_BUF_MAX: usize = 1 << 20;
 
 const ALL_OPTS: u32 = 4095;
 /// Options that change *how* a type we serialize natively is written, and
@@ -33,10 +31,6 @@ const UNSUPPORTED_OPTS: &[(u32, &str)] = &[
 // OPT_PASSTHROUGH_DATACLASS only affect datetime and dataclass objects, which
 // isojson never serializes natively (they always go to `default`), so they
 // are accepted and have no effect.
-
-thread_local! {
-    static BUF: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
-}
 
 static HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -80,7 +74,7 @@ unsafe fn raise_type_error_from_current(msg: &str) {
 }
 
 struct Encoder {
-    out: Vec<u8>,
+    out: Out,
     default: *mut PyObject,
     opts: u32,
     depth: u32,
@@ -205,18 +199,16 @@ impl Encoder {
     }
 
     unsafe fn str(&mut self, obj: *mut PyObject) -> bool {
-        let mut len: Py_ssize_t = 0;
-        let p = PyUnicode_AsUTF8AndSize(obj, &mut len);
-        if p.is_null() {
-            PyErr_Clear();
-            raise_type_error("str is not valid UTF-8: surrogates not allowed");
-            return false;
+        match crate::strfast::as_utf8(obj) {
+            Some(b) => {
+                write_escaped(&mut self.out, b);
+                true
+            }
+            None => {
+                raise_type_error("str is not valid UTF-8: surrogates not allowed");
+                false
+            }
         }
-        write_escaped(
-            &mut self.out,
-            core::slice::from_raw_parts(p.cast(), len as usize),
-        );
-        true
     }
 
     unsafe fn int(&mut self, obj: *mut PyObject) -> bool {
@@ -326,14 +318,11 @@ impl Encoder {
             raise_type_error("Dict key must be str");
             return None;
         }
-        let mut len: Py_ssize_t = 0;
-        let p = PyUnicode_AsUTF8AndSize(key, &mut len);
-        if p.is_null() {
-            PyErr_Clear();
+        let k = crate::strfast::as_utf8(key);
+        if k.is_none() {
             raise_type_error("str is not valid UTF-8: surrogates not allowed");
-            return None;
         }
-        Some(core::slice::from_raw_parts(p.cast(), len as usize))
+        k
     }
 
     unsafe fn write_key(&mut self, k: &[u8], first: bool) {
@@ -449,60 +438,136 @@ impl Encoder {
     }
 }
 
-#[inline]
-fn write_escaped(out: &mut Vec<u8>, s: &[u8]) {
-    // +2 quotes, +8 slack so the word loop may store a full u64 at the end.
-    out.reserve(s.len() + 2 + 8);
-    let mut i = 0;
-    unsafe {
-        let base = out.as_mut_ptr();
-        let mut len = out.len();
-        *base.add(len) = b'"';
-        len += 1;
-        // Fast path: copy 8 bytes at a time while none of them needs escaping.
-        while i + 8 <= s.len() {
-            let w = crate::swar::load(s, i);
-            if crate::swar::has_special(w) {
-                break;
+/// Copy bytes of `s` from `i` to `dst` until the first byte that needs
+/// escaping (or the end). Returns its index; `dst` is advanced past the copied
+/// bytes. May store up to 15 bytes beyond what it reports as copied, so the
+/// caller must have 16 bytes of slack.
+#[inline(always)]
+unsafe fn copy_plain(s: &[u8], mut i: usize, dst: &mut *mut u8) -> usize {
+    let n = s.len();
+    let p = s.as_ptr();
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::*;
+        // SSE2 is part of the x86_64 baseline: no runtime detection needed.
+        let quote = _mm_set1_epi8(b'"' as i8);
+        let bslash = _mm_set1_epi8(b'\\' as i8);
+        let x1f = _mm_set1_epi8(0x1f);
+        while i + 16 <= n {
+            let v = _mm_loadu_si128(p.add(i).cast());
+            _mm_storeu_si128((*dst).cast(), v);
+            // v <= 0x1f  <=>  min(v, 0x1f) == v   (unsigned)
+            let ctrl = _mm_cmpeq_epi8(_mm_min_epu8(v, x1f), v);
+            let hit = _mm_or_si128(
+                ctrl,
+                _mm_or_si128(_mm_cmpeq_epi8(v, quote), _mm_cmpeq_epi8(v, bslash)),
+            );
+            let m = _mm_movemask_epi8(hit) as u32;
+            if m != 0 {
+                let k = m.trailing_zeros() as usize;
+                *dst = dst.add(k);
+                return i + k;
             }
-            core::ptr::write_unaligned(base.add(len).cast::<u64>(), w);
-            len += 8;
-            i += 8;
+            *dst = dst.add(16);
+            i += 16;
         }
-        // Tail (< 8 bytes): copy inline while nothing needs escaping.
-        while i < s.len() && ESCAPE[s[i] as usize] == 0 {
-            *base.add(len) = s[i];
-            len += 1;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        // NEON is part of the aarch64 baseline.
+        let quote = vdupq_n_u8(b'"');
+        let bslash = vdupq_n_u8(b'\\');
+        let x20 = vdupq_n_u8(0x20);
+        while i + 16 <= n {
+            let v = vld1q_u8(p.add(i));
+            vst1q_u8(*dst, v);
+            let hit = vorrq_u8(
+                vcltq_u8(v, x20),
+                vorrq_u8(vceqq_u8(v, quote), vceqq_u8(v, bslash)),
+            );
+            // narrow each 0x00/0xFF byte to a 4-bit nibble of one u64
+            let nib = vget_lane_u64(
+                vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)),
+                0,
+            );
+            if nib != 0 {
+                let k = (nib.trailing_zeros() / 4) as usize;
+                *dst = dst.add(k);
+                return i + k;
+            }
+            *dst = dst.add(16);
+            i += 16;
+        }
+    }
+
+    // 8 bytes at a time (portable), then byte by byte.
+    while i + 8 <= n {
+        let w = crate::swar::load(s, i);
+        if crate::swar::has_special(w) {
+            break;
+        }
+        core::ptr::write_unaligned((*dst).cast::<u64>(), w);
+        *dst = dst.add(8);
+        i += 8;
+    }
+    while i < n && ESCAPE[*p.add(i) as usize] == 0 {
+        **dst = *p.add(i);
+        *dst = dst.add(1);
+        i += 1;
+    }
+    i
+}
+
+#[inline]
+fn write_escaped(out: &mut Out, s: &[u8]) {
+    let n = s.len();
+    // 2 quotes + 16 bytes of slack for copy_plain's full-width stores
+    out.reserve(n + 2 + 16);
+    unsafe {
+        let mut dst = out.as_mut_ptr().add(out.len());
+        *dst = b'"';
+        dst = dst.add(1);
+        let mut i = copy_plain(s, 0, &mut dst);
+        while i < n {
+            let b = *s.get_unchecked(i);
+            let e = ESCAPE[b as usize];
+            if e == b'u' {
+                core::ptr::copy_nonoverlapping(
+                    [
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX[(b >> 4) as usize],
+                        HEX[(b & 0xf) as usize],
+                    ]
+                    .as_ptr(),
+                    dst,
+                    6,
+                );
+                dst = dst.add(6);
+            } else {
+                *dst = b'\\';
+                *dst.add(1) = e;
+                dst = dst.add(2);
+            }
             i += 1;
+            // Escapes grow the output: make sure the rest still fits (plus
+            // one more escape, the closing quote, and the slack).
+            let written = dst.offset_from(out.as_mut_ptr()) as usize;
+            out.set_len(written);
+            out.reserve(n - i + 6 + 1 + 16);
+            dst = out.as_mut_ptr().add(written);
+            i = copy_plain(s, i, &mut dst);
         }
-        if i == s.len() {
-            *base.add(len) = b'"';
-            out.set_len(len + 1);
-            return;
-        }
-        out.set_len(len);
+        *dst = b'"';
+        dst = dst.add(1);
+        let written = dst.offset_from(out.as_mut_ptr()) as usize;
+        out.set_len(written);
     }
-    // Slow path: from the first byte that needs escaping.
-    let mut start = i;
-    while let Some(j) = crate::swar::find_special(s, start) {
-        out.extend_from_slice(&s[start..j]);
-        let b = s[j];
-        if ESCAPE[b as usize] == b'u' {
-            out.extend_from_slice(&[
-                b'\\',
-                b'u',
-                b'0',
-                b'0',
-                HEX[(b >> 4) as usize],
-                HEX[(b & 0xf) as usize],
-            ]);
-        } else {
-            out.extend_from_slice(&[b'\\', ESCAPE[b as usize]]);
-        }
-        start = j + 1;
-    }
-    out.extend_from_slice(&s[start..]);
-    out.push(b'"');
 }
 
 unsafe fn kw_is(name: *mut PyObject, s: &CStr) -> bool {
@@ -581,8 +646,9 @@ pub(crate) unsafe extern "C" fn dumps(
         }
     }
 
-    let mut out = BUF.take();
-    out.clear();
+    let Some(out) = Out::new() else {
+        return ptr::null_mut();
+    };
     let mut enc = Encoder {
         out,
         default,
@@ -590,18 +656,11 @@ pub(crate) unsafe extern "C" fn dumps(
         depth: 0,
         default_depth: 0,
     };
-    let ok = enc.serialize(obj);
-    let mut out = enc.out;
-    let result = if ok {
-        if opts & OPT_APPEND_NEWLINE != 0 {
-            out.push(b'\n');
-        }
-        PyBytes_FromStringAndSize(out.as_ptr().cast(), out.len() as Py_ssize_t)
-    } else {
-        ptr::null_mut()
-    };
-    if out.capacity() <= KEEP_BUF_MAX {
-        BUF.set(out);
+    if !enc.serialize(obj) {
+        return ptr::null_mut(); // `enc.out` releases the partial bytes
     }
-    result
+    if opts & OPT_APPEND_NEWLINE != 0 {
+        enc.out.push(b'\n');
+    }
+    enc.out.finish()
 }

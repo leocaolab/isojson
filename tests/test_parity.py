@@ -321,3 +321,37 @@ def test_loads_float_text_correctly_rounded():
             continue
         got = isojson.loads(s)
         assert type(got) is float and struct.pack("<d", got) == struct.pack("<d", expect), (s, got, expect)
+
+
+def test_escape_at_every_position():
+    """A special character at every offset of strings up to 80 bytes, so each
+    position of the 16-byte SIMD block, the 8-byte SWAR step, and the scalar
+    tail is hit — for ASCII and multi-byte text."""
+    specials = ['"', "\\", "\n", "\x00", "\x1f", "\x7f", "é", "🔥"]
+    for fill in ("a", "日"):
+        for n in range(0, 81):
+            for pos in range(n + 1):
+                for sp in specials:
+                    s = fill * pos + sp + fill * (n - pos)
+                    assert isojson.dumps(s) == orjson.dumps(s), (fill, n, pos, sp)
+    dense = "".join(chr(c) for c in range(0, 0x80)) * 50
+    assert isojson.dumps(dense) == orjson.dumps(dense)
+    assert isojson.dumps({dense: [dense]}) == orjson.dumps({dense: [dense]})
+
+
+def test_output_growth():
+    """Small output first (small size hint), then documents large enough to
+    force the output buffer to grow several times, then small again."""
+    assert isojson.dumps(1) == b"1"
+    for n in (10, 1_000, 100_000, 2_000_000):
+        doc = {"k": ["x" * 37, '"quoted"\n' * 3, 1.5, n] * (n // 10 + 1)}
+        assert isojson.dumps(doc) == orjson.dumps(doc)
+    assert isojson.dumps([1]) == b"[1]"
+
+
+def test_str_fast_path_is_active():
+    """On CPython 3.12-3.14 GIL builds the import-time self-check must pass;
+    if it silently failed, isojson would still be correct but slower."""
+    import sysconfig
+    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        assert isojson.isojson._str_fastpath is True

@@ -6,7 +6,7 @@
 //! values are `null`.
 
 #[inline]
-pub(crate) fn write_f64(out: &mut Vec<u8>, v: f64) {
+pub(crate) fn write_f64(out: &mut crate::out::Out, v: f64) {
     if !v.is_finite() {
         out.extend_from_slice(b"null");
         return;
@@ -19,7 +19,7 @@ pub(crate) fn write_f64(out: &mut Vec<u8>, v: f64) {
 /// fixed-size copies cover every length in a size class, and fixed-size
 /// copies compile to plain loads/stores. Never reads outside `src`.
 #[inline(always)]
-pub(crate) fn small_copy(out: &mut Vec<u8>, src: &[u8]) {
+pub(crate) fn small_copy(out: &mut crate::out::Out, src: &[u8]) {
     let n = src.len();
     debug_assert!(n <= 32);
     out.reserve(n);

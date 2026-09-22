@@ -19,6 +19,8 @@ mod decode;
 mod encode;
 mod float;
 mod number;
+mod out;
+mod strfast;
 mod swar;
 
 use core::ffi::{c_int, c_void};
@@ -109,6 +111,18 @@ unsafe extern "C" fn module_exec(m: *mut PyObject) -> c_int {
         if add_int(m, name, v) < 0 {
             return -1;
         }
+    }
+    if strfast::self_check() < 0 {
+        return -1;
+    }
+    // private: lets the test suite assert the str fast path is active
+    let fast = if strfast::enabled() {
+        Py_True()
+    } else {
+        Py_False()
+    };
+    if PyModule_AddObjectRef(m, c"_str_fastpath".as_ptr(), fast) < 0 {
+        return -1;
     }
     if PyModule_AddStringConstant(
         m,
