@@ -40,23 +40,6 @@ thread_local! {
 
 static HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// Append a short slice (numbers, keys) with an inline loop instead of a
-/// `memcpy` call — for the few-byte copies that dominate JSON output, the
-/// call overhead exceeds the copy.
-#[inline(always)]
-fn put(out: &mut Vec<u8>, b: &[u8]) {
-    out.reserve(b.len());
-    unsafe {
-        let mut len = out.len();
-        let base = out.as_mut_ptr();
-        for &x in b {
-            *base.add(len) = x;
-            len += 1;
-        }
-        out.set_len(len);
-    }
-}
-
 /// 0 = copy through; otherwise the escape letter (`u` = \u00XX form).
 static ESCAPE: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -140,8 +123,13 @@ impl Encoder {
             return true;
         }
         if ty == &raw mut PyBool_Type {
-            self.out
-                .extend_from_slice(if obj == Py_True() { b"true" } else { b"false" });
+            // constant-length copy per branch (a slice chosen by `if` has a
+            // non-constant length and would become a memcpy call)
+            if obj == Py_True() {
+                self.out.extend_from_slice(b"true");
+            } else {
+                self.out.extend_from_slice(b"false");
+            }
             return true;
         }
         if obj == Py_None() {
@@ -245,14 +233,14 @@ impl Encoder {
                 return false;
             }
             let mut b = itoa::Buffer::new();
-            put(&mut self.out, b.format(v).as_bytes());
+            crate::float::small_copy(&mut self.out, b.format(v).as_bytes());
             return true;
         }
         if overflow > 0 && self.opts & OPT_STRICT_INTEGER == 0 {
             let u = PyLong_AsUnsignedLongLong(obj);
             if u != u64::MAX || PyErr_Occurred().is_null() {
                 let mut b = itoa::Buffer::new();
-                put(&mut self.out, b.format(u).as_bytes());
+                crate::float::small_copy(&mut self.out, b.format(u).as_bytes());
                 return true;
             }
             PyErr_Clear();

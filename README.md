@@ -51,7 +51,7 @@ orjson is the fastest JSON library for CPython, but it does not meet these
 requirements and refuses to import in a sub-interpreter. That left people
 running sub-interpreters two options:
 
-- **stdlib `json`**: safe, but 2.6–11× slower than orjson depending on the
+- **stdlib `json`**: safe, but 2.7–13× slower than orjson depending on the
   payload (see the tables below);
 - **a physical copy of orjson's shared library per worker**, loaded under an
   override. This works, but you pay one copy's memory, disk, and load time per
@@ -147,29 +147,30 @@ second; higher is better.
 
 | setup | N=1 | N=2 | N=4 | N=8 | scaling 1→8 |
 |---|---:|---:|---:|---:|---:|
-| **isojson, N own-GIL sub-interpreters, one process** | 18,645 | 36,477 | 68,846 | **118,705** | **6.37×** |
-| json (stdlib), N own-GIL sub-interpreters | 4,657 | 8,961 | 16,789 | 29,433 | 6.32× |
+| **isojson, N own-GIL sub-interpreters, one process** | 19,316 | 37,667 | 64,965 | **117,274** | **6.07×** |
+| json (stdlib), N own-GIL sub-interpreters | 4,673 | 8,898 | 16,153 | 29,332 | 6.28× |
 | orjson, N own-GIL sub-interpreters | ✗ | ✗ | ✗ | ✗ | — |
-| orjson, N threads, one interpreter (shared GIL) | 23,493 | 23,728 | 23,244 | 22,938 | 0.98× |
-| isojson, N threads, one interpreter (shared GIL) | 17,882 | 17,926 | 18,168 | 18,171 | 1.02× |
-| orjson, N processes (multiprocessing) | 23,963 | 45,477 | 85,004 | 153,942 | 6.42× |
-| isojson, N processes (multiprocessing) | 18,693 | 35,771 | 66,224 | 122,675 | 6.56× |
+| orjson, N threads, one interpreter (shared GIL) | 22,780 | 23,389 | 22,727 | 23,872 | 1.05× |
+| isojson, N threads, one interpreter (shared GIL) | 19,530 | 19,477 | 19,396 | 19,116 | 0.98× |
+| orjson, N processes (multiprocessing) | 23,370 | 43,621 | 81,240 | 149,781 | 6.41× |
+| isojson, N processes (multiprocessing) | 19,131 | 36,212 | 66,764 | 125,719 | 6.57× |
 
 ✗ `ImportError: module orjson.orjson does not support loading in subinterpreters`
 
 How to read this:
 
-- **In one process, isojson on 8 sub-interpreters is 5.0× the best orjson can
-  do** (118.7k vs 23.7k round trips/s). Adding threads to orjson gains nothing
+- **In one process, isojson on 8 sub-interpreters is 4.9× the best orjson can
+  do** (117.3k vs 23.9k round trips/s). Adding threads to orjson gains nothing
   because every thread shares one GIL.
 - **isojson on sub-interpreters is 4.0× stdlib `json` on sub-interpreters**,
   and stdlib `json` was the only other option that works there.
-- **isojson on sub-interpreters scales as well as isojson on processes**
-  (118.7k vs 122.7k at N=8). Sub-interpreters reach process-level scaling with
-  one process, one address space, and shared memory.
-- **orjson on 8 processes is still faster** (153.9k) because orjson is faster
-  per call. If you already run multiprocessing and never use sub-interpreters,
-  orjson remains the faster choice.
+- **isojson on sub-interpreters scales nearly as well as isojson on
+  processes** (117.3k vs 125.7k at N=8). Sub-interpreters get close to
+  process-level scaling with one process, one address space, and shared
+  memory.
+- **orjson on 8 processes is still faster** (149.8k) because orjson is faster
+  per call on this document. If you already run multiprocessing and never use
+  sub-interpreters, orjson remains the faster choice.
 
 ### Single interpreter: per-call cost
 
@@ -177,31 +178,31 @@ How to read this:
 
 | payload | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 51 ns | 55 ns | 606 ns | 0.92× |
-| records ×100 | 22.21 µs | 17.17 µs | 155.68 µs | 1.29× |
-| records ×2000 | 429.69 µs | 298.72 µs | 2.91 ms | 1.44× |
-| floats ×10k | 198.15 µs | 206.32 µs | 2.33 ms | 0.96× |
-| unicode/escapes ×200 | 17.57 µs | 11.22 µs | 119.58 µs | 1.57× |
+| small (27 B) | 43 ns | 46 ns | 601 ns | 0.94× |
+| records ×100 | 20.24 µs | 17.10 µs | 154.86 µs | 1.18× |
+| records ×2000 | 390.11 µs | 298.73 µs | 2.86 ms | 1.31× |
+| floats ×10k | 98.08 µs | 205.63 µs | 2.28 ms | **0.48×** |
+| unicode/escapes ×200 | 17.57 µs | 11.39 µs | 116.35 µs | 1.54× |
 
 `loads` (lower is better):
 
 | payload | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 86 ns | 84 ns | 567 ns | 1.02× |
-| records ×100 | 54.31 µs | 41.78 µs | 119.12 µs | 1.30× |
-| records ×2000 | 1.15 ms | 836.98 µs | 2.17 ms | 1.37× |
-| floats ×10k | 302.32 µs | 168.19 µs | 1.10 ms | 1.80× |
-| unicode/escapes ×200 | 58.28 µs | 46.21 µs | 126.78 µs | 1.26× |
+| small (27 B) | 82 ns | 80 ns | 562 ns | 1.02× |
+| records ×100 | 52.79 µs | 40.12 µs | 108.58 µs | 1.32× |
+| records ×2000 | 1.10 ms | 803.72 µs | 2.15 ms | 1.37× |
+| floats ×10k | 293.54 µs | 171.09 µs | 1.14 ms | 1.72× |
+| unicode/escapes ×200 | 59.87 µs | 45.74 µs | 126.34 µs | 1.31× |
 
-In summary: isojson ties orjson on tiny documents and on float-heavy `dumps`.
-Elsewhere it is 1.3–1.8× slower per call. It is 1.9–12× faster than stdlib
-`json` everywhere.
+In summary: isojson ties orjson on tiny documents and is about 2× faster on
+float-heavy `dumps`. Elsewhere it is 1.2–1.7× slower per call. It is 2–23×
+faster than stdlib `json` everywhere.
 
 Part of the gap to orjson is a deliberate choice. orjson reads CPython's
 internal object layouts directly, and isojson goes through the C API. That
 costs time per call but keeps the extension off version-specific struct
-layouts. There is still room to speed it up, mainly in the float parser and in
-dict iteration.
+layouts. There is still room to speed it up, mainly in `loads` number
+parsing, in dict iteration, and in the final copy into the result `bytes`.
 
 ## Testing
 
