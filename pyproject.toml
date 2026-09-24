@@ -18,7 +18,7 @@ classifiers = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest", "orjson"]
+test = ["pytest", "orjson==3.12.0", "numpy>=2", "pytz", "tzdata"]
 
 [project.urls]
 Repository = "https://github.com/leocaolab/isojson"
