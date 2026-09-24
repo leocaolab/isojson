@@ -27,6 +27,19 @@ jobs:
       - run: cargo clippy --release -- -D warnings
         env:
           PYO3_PYTHON: python
+      - run: cargo clippy --tests -- -D warnings
+        env:
+          PYO3_PYTHON: python
+      # The pure core (datetime.rs, decline.rs) is unit-tested without an
+      # interpreter; the test binary still links libpython, so point the
+      # loader at setup-python's copy.
+      - name: cargo test --lib
+        shell: bash
+        run: |
+          export LD_LIBRARY_PATH="$(python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          cargo test --lib
+        env:
+          PYO3_PYTHON: python
 
   test:
     name: test (${{ matrix.os }}, ${{ matrix.python }})

@@ -15,6 +15,8 @@
 #[cfg(Py_3_15)]
 compile_error!("isojson does not support Python 3.15 yet (PyModExport init is not wired)");
 
+mod datetime;
+mod decline;
 mod decode;
 mod encode;
 mod float;
@@ -36,6 +38,11 @@ pub(crate) struct ModState {
     /// Recently seen dict keys for `loads` — this interpreter's objects only.
     pub(crate) key_cache: *mut decode::KeyCache,
 }
+
+/// A Python exception is already set (e.g. MemoryError).
+pub(crate) struct PyErrSet;
+
+pub(crate) type R<T> = Result<T, PyErrSet>;
 
 #[inline]
 pub(crate) unsafe fn state(module: *mut PyObject) -> *mut ModState {

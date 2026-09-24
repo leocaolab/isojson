@@ -11,8 +11,64 @@ pub(crate) fn write_f64(out: &mut crate::out::Out, v: f64) {
         out.extend_from_slice(b"null");
         return;
     }
+    write_finite(out, v);
+}
+
+/// float32, and float16 widened with `f16_to_f32`: the shortest digits that
+/// round-trip through f32, with zmij's f32 notation switch (as orjson).
+#[expect(dead_code, reason = "wired into numpy.rs in M2 (isojson#3)")]
+#[inline]
+pub(crate) fn write_f32(out: &mut crate::out::Out, v: f32) {
+    if !v.is_finite() {
+        out.extend_from_slice(b"null");
+        return;
+    }
+    write_finite(out, v);
+}
+
+/// `v` must be finite. zmij's `Float` trait is sealed, so the finite check
+/// can't be written generically and lives in the typed writers.
+#[inline]
+fn write_finite<F: zmij::Float>(out: &mut crate::out::Out, v: F) {
     let mut buf = zmij::Buffer::new();
     small_copy(out, buf.format_finite(v).as_bytes());
+}
+
+// SPDX-License-Identifier: (Apache-2.0 OR MIT)
+// Copyright half-rs Contributors (2016-2026)
+// https://github.com/VoidStarKat/half-rs
+//
+// `f16_to_f32_fallback` as shipped in orjson (`src/serialize/writer/half.rs`),
+// adapted to this crate's MSRV 1.85: `as` casts in place of
+// `cast_signed`/`cast_unsigned` (stable in 1.87), and `f32::from_bits`
+// without `unsafe`. Exact: every f16 is an f32. Proven over all 65,536 inputs
+// by E2E-12.
+#[expect(dead_code, reason = "wired into numpy.rs in M2 (isojson#3)")]
+pub(crate) const fn f16_to_f32(i: u16) -> f32 {
+    if i & 0x7FFFu16 == 0 {
+        return f32::from_bits((i as u32) << 16);
+    }
+    let half_sign = (i & 0x8000u16) as u32;
+    let half_exp = (i & 0x7C00u16) as u32;
+    let half_man = (i & 0x03FFu16) as u32;
+    if half_exp == 0x7C00u32 {
+        if half_man == 0 {
+            return f32::from_bits((half_sign << 16) | 0x7F80_0000u32);
+        } else {
+            return f32::from_bits((half_sign << 16) | 0x7FC0_0000u32 | (half_man << 13));
+        }
+    }
+    let sign = half_sign << 16;
+    let unbiased_exp = ((half_exp as i32) >> 10) - 15;
+    if half_exp == 0 {
+        let e = (half_man as u16).leading_zeros() - 6;
+        let exp = (127 - 15 - e) << 23;
+        let man = (half_man << (14 + e)) & 0x7F_FF_FFu32;
+        return f32::from_bits(sign | exp | man);
+    }
+    let exp = ((unbiased_exp + 127) as u32) << 23;
+    let man = (half_man & 0x03FFu32) << 13;
+    f32::from_bits(sign | exp | man)
 }
 
 /// Append up to 32 bytes without a `memcpy` call: two possibly-overlapping

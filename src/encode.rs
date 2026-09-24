@@ -73,6 +73,12 @@ unsafe fn raise_type_error_from_current(msg: &str) {
     }
 }
 
+#[inline]
+pub(crate) fn write_int<I: itoa::Integer>(out: &mut Out, v: I) {
+    let mut b = itoa::Buffer::new();
+    crate::float::small_copy(out, b.format(v).as_bytes());
+}
+
 struct Encoder {
     out: Out,
     default: *mut PyObject,
@@ -224,15 +230,13 @@ impl Encoder {
                 raise_type_error("Integer exceeds 53-bit range");
                 return false;
             }
-            let mut b = itoa::Buffer::new();
-            crate::float::small_copy(&mut self.out, b.format(v).as_bytes());
+            write_int(&mut self.out, v);
             return true;
         }
         if overflow > 0 && self.opts & OPT_STRICT_INTEGER == 0 {
             let u = PyLong_AsUnsignedLongLong(obj);
             if u != u64::MAX || PyErr_Occurred().is_null() {
-                let mut b = itoa::Buffer::new();
-                crate::float::small_copy(&mut self.out, b.format(u).as_bytes());
+                write_int(&mut self.out, u);
                 return true;
             }
             PyErr_Clear();
