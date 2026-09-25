@@ -684,3 +684,35 @@ decisions):
 **Gate result:** zero blocking. The design is finished. Blocking findings by round:
 12 → 4 → 6 → 3 → 8 → 1 → 1 → 4 → 2 → 1 → 1 → **0**. The round-5 consolidated rewrite
 (single homes) is what made it converge. Next per method: `impl-roadmap`.
+
+## Step 4 — Build plans (impl-build P0, one per milestone)
+
+### M0 (isojson#1) — pure core
+
+- **Ports and doubles:** none. M0 is pure functions (`datetime.rs`, `decline.rs`, the
+  f16 widening); nothing in it touches IO or Python, so there is no adapter to mock and
+  P3 ("real adapters") is empty. The compiler boundary is the E2E-9 (2) purity ban, run
+  as `tests/test_no_global_pyobject.py` (its purity part lands in M0; M1 adds the rest).
+- **Oracle (the test double of M0):** an exact-integer model of §1a written separately
+  from §8.3, in `src/datetime.rs`'s test module: total µs as i128 by unit table,
+  `floor` to days, date by a year/month walk (not Hinnant's formula), range by comparing
+  µs against 0000-01-01 and 10000-01-01. Same model the round-12 auditor used.
+- **Test data:** boundary sets per unit (i64 MIN, MIN+1, MAX, 0, ±1, ±2 around the
+  0000-01-01 and 10000-01-01 crossings for each unit × mult) plus seeded splitmix64
+  values; no files.
+- **Case matrix:** C6's list, verbatim —
+  exhaustive `civil_from_days` over [−719528, 2932896] against a day-by-day walk;
+  `dt64_to_parts` at DV-8…11/16 boundaries; the property test (13 units ×
+  {1,2,3,7,10,1000} × boundaries + random) against the model; `parse_dt64` valid /
+  multiplied / unparseable; `classify` in orjson's order; `reason_message` and
+  `reason_note` for every `Reason`. Plus the `fmt_*` formatters (they are the §8.2 text).
+  `f16_to_f32` has no Rust test by design (R4-A7); E2E-12 is its proof in M2.
+- **E2E:** the existing pytest suite, unchanged, proves the C2 refactors
+  (`PyErrSet`/`R<T>` move, `write_int`) change nothing.
+- **TDD order:** signatures (P1, `todo!`-free canned bodies) → tests red → real bodies.
+- **Interface resolution (found at P1):** design C4 gives
+  `classify(flags, nd, kind, itemsize) -> Option<Reason>`, but `Reason`'s (a)–(d)
+  variants carry evidence `classify` does not receive (`shape`, and `dtype.str`, which
+  needs a Python read). Resolved as `classify(..) -> Result<Elem, Check>`: `Check` names
+  the rule (a)–(d), `Elem` is the accepted dtype (the dtype table's single home), and
+  `numpy.rs` builds the `Reason` with the evidence it reads. Design C4 amended.
