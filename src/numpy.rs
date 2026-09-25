@@ -188,6 +188,9 @@ macro_rules! leaf {
     };
 }
 
+/// Elements per capacity reservation in a compact row.
+const ROW_CHUNK: isize = 1024;
+
 /// Writes a whole compact row `[a,b,…]` of `n` elements `stride` apart.
 type RowFn = unsafe fn(&mut Out, *const u8, isize, isize);
 
@@ -297,11 +300,16 @@ where
             row(&mut enc.out, p, n, stride);
             return Ok(());
         }
-        // one reserve per row: the leaves' own capacity checks never grow it
-        enc.out.reserve(n as usize * row_bytes + 2);
     }
     enc.out.push(b'[');
     for i in 0..n {
+        // one reserve per chunk of a compact row: the leaves' own capacity
+        // checks never grow it, and a very long row doesn't allocate its
+        // whole worst case up front
+        if last && !indent && i % ROW_CHUNK == 0 {
+            enc.out
+                .reserve((n - i).min(ROW_CHUNK) as usize * row_bytes + 1);
+        }
         if i > 0 {
             enc.out.push(b',');
         }

@@ -175,6 +175,22 @@ unsafe fn delta_us(r: *mut PyObject) -> Option<i64> {
     out
 }
 
+/// An exact `str`, `int`, `float`, `bool` or `None`: serializing it reads the
+/// object's own data and never runs Python code (no `__index__`, `__float__`,
+/// `utcoffset()` or `default`), so nothing can mutate the container holding
+/// it meanwhile, and the FR-13 guard needn't hold a reference to it (or to its
+/// dict key). Holding one costs a refcount write to every leaf, which on
+/// x86_64 made a list of 100k floats ~40% slower.
+#[inline(always)]
+unsafe fn runs_no_python(obj: *mut PyObject) -> bool {
+    let ty = Py_TYPE(obj);
+    ty == &raw mut PyFloat_Type
+        || ty == &raw mut PyUnicode_Type
+        || ty == &raw mut PyLong_Type
+        || ty == &raw mut PyBool_Type
+        || obj == Py_None()
+}
+
 #[inline]
 pub(crate) fn write_int<I: itoa::Integer>(out: &mut Out, v: I) {
     let mut b = itoa::Buffer::new();
@@ -353,10 +369,11 @@ impl Encoder {
     /// Serialize a borrowed container item. With `guard` false no Python code
     /// can run during serialization, so the container cannot be mutated and
     /// the borrow is safe as is. With it set, that code could mutate the
-    /// container and drop the item, so hold a reference across the call.
+    /// container and drop the item, so hold a reference across the call —
+    /// unless the item is a leaf that runs no Python itself (FR-13).
     #[inline]
     unsafe fn guarded(&mut self, item: *mut PyObject) -> bool {
-        if !self.guard {
+        if !self.guard || runs_no_python(item) {
             return self.serialize(item);
         }
         Py_INCREF(item);
@@ -738,7 +755,7 @@ impl Encoder {
                 return false;
             };
             self.write_key(k, first);
-            if !self.guard {
+            if !self.guard || runs_no_python(value) {
                 if !self.serialize(value) {
                     return false;
                 }
