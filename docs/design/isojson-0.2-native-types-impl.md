@@ -716,3 +716,31 @@ decisions):
   needs a Python read). Resolved as `classify(..) -> Result<Elem, Check>`: `Check` names
   the rule (a)–(d), `Elem` is the accepted dtype (the dtype table's single home), and
   `numpy.rs` builds the `Reason` with the evidence it reads. Design C4 amended.
+
+### M1 (isojson#2) — type cache, guard, native datetime
+
+- **Ports and doubles:** CPython itself is the adapter; there is no in-memory
+  double for an interpreter. The reusable test homes are `tests/interp/strict.py`
+  (strict own-GIL interpreters, 3.12–3.14) and `tests/oracle/python_api.py`
+  (`expected_text`, `adjusted`, `NoAnswer`). Crash-class cases (E2E-4 death rows,
+  E2E-6, E2E-10) run in child processes under `PYTHONMALLOC=debug`.
+- **Mutation check:** with `guarded()` / `dict_in_order` forced unguarded, E2E-10
+  fails 7/7 (use-after-free under the debug allocator); restored.
+- **Found while building:**
+  - DV-17 (new §1b row): orjson drops the leading zero of a `time`'s five-digit
+    microsecond (90,000 values). Found by E2E-2's random documents.
+  - DV-4a: every option combination *with* `NAIVE_UTC` agrees with orjson;
+    E2E-4's text corrected (round 8 had it wrong for `NAIVE_UTC|UTC_Z`).
+    orjson spells the invented offset `+00:00` on 3.12/3.13 and `Z` under
+    `UTC_Z` on 3.14; E2E-4 (a) accepts either.
+  - E2E-6 is 3.14-only: CPython 3.13.15's own `_datetime` crashes under
+    concurrent strict interpreters with isojson not involved (design §1,
+    E2E-6). Maintainer: "我们都升级到3.14 not a big deal".
+  - pyo3-ffi's 3.12 `PyDict_GetItemRef` shim lives at `pyo3_ffi::compat`.
+- **Moved to later milestones (not dropped):** E2E-5's `option=NUMPY` call, E2E-10's
+  numpy variant and E2E-9 (4)'s numpy check → M2 (numpy option still raises in M1);
+  E2E-9 (3) (README DV list) → M4 with the README rewrite. E2E-9 (4) checks the
+  datetime types now.
+- **README/crate doc:** the statements M1 made false were corrected now (shared-state
+  row, per-interpreter state paragraph, process-global pointers, "borrows and doesn't
+  keep"); the full C7 rewrite stays in M4.

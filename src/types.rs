@@ -62,7 +62,7 @@ pub(crate) struct TypeCache {
 /// `d[key]` as a strong reference; `Ok(None)` if missing.
 unsafe fn get_item(d: *mut PyObject, key: *mut PyObject) -> R<Option<*mut PyObject>> {
     let mut v = ptr::null_mut();
-    match PyDict_GetItemRef(d, key, &mut v) {
+    match pyo3_ffi::compat::PyDict_GetItemRef(d, key, &mut v) {
         1 => Ok(Some(v)),
         0 => Ok(None),
         _ => Err(PyErrSet),

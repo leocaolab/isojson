@@ -5,9 +5,9 @@
 //! in process-global storage.** Everything that must outlive a call lives in
 //! the module's per-interpreter state (`ModState`), which CPython allocates
 //! once per interpreter and tears down with it. The only process-global
-//! pointers we touch are CPython's static builtin types and the immortal
-//! singletons (`None`/`True`/`False`), which every interpreter shares by
-//! design and never refcounts.
+//! pointers we touch are CPython's static builtin types, `_datetime`'s static
+//! types and C-API struct, and the immortal singletons (`None`/`True`/
+//! `False`), which every interpreter shares by design.
 //!
 //! Multi-phase init (PEP 489) + `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` means
 //! the module loads in strict own-GIL sub-interpreters with no override.
