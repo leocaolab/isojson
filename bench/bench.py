@@ -307,6 +307,8 @@ def baseline_cells():
         raw = orjson.dumps(obj)
         cells[f"dumps {name}"] = _median(lambda obj=obj: isojson.dumps(obj))
         cells[f"loads {name}"] = _median(lambda raw=raw: isojson.loads(raw))
+    import numpy  # noqa: F401  (NFR-5 compares with numpy loaded on both sides; it slows `str` on 0.1 too)
+
     objs = [object()] * 1000
     cells["nfr5"] = _median(lambda: isojson.dumps(objs, default=str))
     return cells

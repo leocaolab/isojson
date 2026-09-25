@@ -241,14 +241,20 @@ impl TypeCache {
         Ok(Some(dt))
     }
 
+    /// The cached numpy group if `ty` is one of its types; no lookup.
+    #[inline(always)]
+    pub(crate) fn numpy_hit(&self, ty: *mut PyTypeObject) -> Option<NumpyTypes> {
+        (!self.np_module.is_null() && self.np.contains(ty)).then_some(self.np)
+    }
+
     /// The numpy group if `ty` is one of its types (design §8.1, FR-3).
     ///
     /// A hit is trusted. On a miss, the group is re-read only if
     /// `sys.modules["numpy"]` is no longer the module it was read from; if
     /// numpy is absent, not a module, or lacks a name, the group is Absent.
     pub(crate) unsafe fn numpy(&mut self, ty: *mut PyTypeObject) -> R<Option<NumpyTypes>> {
-        if !self.np_module.is_null() && self.np.contains(ty) {
-            return Ok(Some(self.np));
+        if let Some(np) = self.numpy_hit(ty) {
+            return Ok(Some(np));
         }
         if self.names.numpy.is_null() {
             return Ok(None);

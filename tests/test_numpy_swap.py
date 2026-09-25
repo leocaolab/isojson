@@ -88,3 +88,24 @@ def test_non_module_is_absent_without_error(value):
         """
     )
     assert out == '["D",1]'
+
+
+def test_recheck_is_once_per_call():
+    """FR-3 re-checks `sys.modules["numpy"]` at a call's first miss only: a
+    numpy replaced by `default` mid-call is seen from the next call."""
+    out = run(
+        """
+        F = type("float64", (np.float64,), {})
+        fake = types.ModuleType("numpy")
+        fake.__dict__.update({k: v for k, v in np.__dict__.items() if not k.startswith("__")})
+        fake.float64 = F
+        def default(o):
+            if isinstance(o, F):
+                return "D"
+            sys.modules["numpy"] = fake     # swapped after this call's first miss
+            return "x"
+        print(isojson.dumps([object(), F(2.5)], option=N, default=default).decode())
+        print(isojson.dumps([F(2.5)], option=N, default=default).decode())
+        """
+    )
+    assert out.splitlines() == ['["x","D"]', "[2.5]"]

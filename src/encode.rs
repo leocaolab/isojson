@@ -217,6 +217,8 @@ pub(crate) struct Encoder {
     pub(crate) guard: bool,
     /// The datetime group, resolved at the start of `dumps`.
     dt: Option<DtTypes>,
+    /// FR-3's `sys.modules["numpy"]` re-check already ran in this call.
+    np_rechecked: bool,
 }
 
 impl Encoder {
@@ -318,7 +320,17 @@ impl Encoder {
             }
         }
         if self.opts & OPT_SERIALIZE_NUMPY != 0 {
-            match (*self.cache).numpy(ty) {
+            // A hit is trusted; a miss re-checks `sys.modules["numpy"]` once
+            // per call (FR-3), not once per object bound for `default`
+            let np = match (*self.cache).numpy_hit(ty) {
+                Some(np) => Ok(Some(np)),
+                None if !self.np_rechecked => {
+                    self.np_rechecked = true;
+                    (*self.cache).numpy(ty)
+                }
+                None => Ok(None),
+            };
+            match np {
                 Err(PyErrSet) => return false,
                 Ok(Some(np)) => {
                     let outcome = if ty == np.ndarray {
@@ -1046,6 +1058,7 @@ pub(crate) unsafe extern "C" fn dumps(
         cache,
         guard,
         dt,
+        np_rechecked: false,
     };
     if !enc.serialize(obj) {
         return ptr::null_mut(); // `enc.out` releases the partial bytes
