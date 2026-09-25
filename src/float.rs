@@ -27,10 +27,21 @@ pub(crate) fn write_f32(out: &mut crate::out::Out, v: f32) {
 
 /// `v` must be finite. zmij's `Float` trait is sealed, so the finite check
 /// can't be written generically and lives in the typed writers.
+///
+/// The digits are formatted in place at the end of `out` (as orjson does):
+/// `zmij::Buffer` is a byte array (alignment 1) and `format_finite` always
+/// writes from its start. Formatting into a stack buffer and copying it out
+/// reloads bytes just written by smaller stores, which x86 can't forward:
+/// measured on x86_64, 25–36 ns per float for values in [0, 1), normals and
+/// integral floats, against 16–18 ns in place.
 #[inline]
 fn write_finite<F: zmij::Float>(out: &mut crate::out::Out, v: F) {
-    let mut buf = zmij::Buffer::new();
-    small_copy(out, buf.format_finite(v).as_bytes());
+    out.reserve(core::mem::size_of::<zmij::Buffer>());
+    unsafe {
+        let buf = &mut *out.as_mut_ptr().add(out.len()).cast::<zmij::Buffer>();
+        let n = buf.format_finite(v).len();
+        out.set_len(out.len() + n);
+    }
 }
 
 // SPDX-License-Identifier: (Apache-2.0 OR MIT)
