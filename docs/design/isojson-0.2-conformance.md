@@ -45,11 +45,12 @@ true as the files move.
   | NFR-2 datetime records | ≤ 1.2× orjson | 0.79× | 1.04× | ✅ |
   | NFR-3 numpy arrays | ≤ 1.2× | 0.69×, 0.71×, 1.08× | 1.01×, 1.02×, 1.03× | ✅ |
   | NFR-4 numpy scalars | ≤ 1.3× | 0.71×, 0.75× | 1.08×, 1.09× | ✅ |
-  | NFR-5 `default` path with the numpy option | ≤ 1.10× of 0.1 | 1.02× | 1.13× | ❌ Linux, recorded in #10 |
+  | NFR-5 `default` path with the numpy option | ≤ 1.10× of 0.1 | 1.02× | 1.13× | **accepted** (#10) |
   | NFR-6 concurrency | 0 failures | E2E-6 green | E2E-6 green (CI) | ✅ |
 
-  NFR-1 was accepted by the maintainer (2026-09-25); NFR-5 on Linux is the
-  same per-object overhead and is recorded with it in leocaolab/isojson#10.
+  NFR-1 and NFR-5 (Linux) were accepted by the maintainer, 2026-09-25: "我们的
+  主要目的就是多核安全性" — isojson's goal is multi-core safety; the few-percent
+  per-call gaps are tracked in leocaolab/isojson#10.
   Found and fixed while measuring: floats formatted in a stack buffer and
   copied out (x86 store-forwarding; NFR-3/4 were 1.5–1.8× on Linux), the FR-13
   guard referencing leaves, a whole-row reserve for long rows, a
