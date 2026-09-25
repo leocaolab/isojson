@@ -257,7 +257,7 @@ x86_64; a manual release gate)
 - **Interface:**
   ```rust
   #[repr(C)] pub(crate) struct TypeCache { dt_capsule: *mut PyObject, dt: DtTypes, np_module: *mut PyObject, np: NumpyTypes, names: Names }
-  #[derive(Clone, Copy)] pub(crate) struct DtTypes { datetime: *mut PyTypeObject, date: *mut PyTypeObject, time: *mut PyTypeObject }
+  #[derive(Clone, Copy)] pub(crate) struct DtTypes { datetime: *mut PyTypeObject, date: *mut PyTypeObject, time: *mut PyTypeObject, delta: *mut PyTypeObject } // delta: utcoffset() results are checked against it (M4)
   #[derive(Clone, Copy)] pub(crate) struct NumpyTypes { ndarray: *mut PyTypeObject, /* 13 scalars */ }
   impl TypeCache {
       unsafe fn init(&mut self) -> c_int;
@@ -318,7 +318,7 @@ x86_64; a manual release gate)
   (`PyDateTime_DATE_GET_TZINFO` / `PyDateTime_TIME_GET_TZINFO`, which return `None` when
   `hastzinfo` is 0).
   - If it is `None`, the value is naive and no method is called.
-  - Otherwise it calls `obj.utcoffset()`; a `None` result is also naive (§1a, DV-4a).
+  - Otherwise it does CPython's own `call_tzinfo_method` inline (M4, NFR-2): `tzinfo.utcoffset(arg)` (`arg` = the datetime, or `None` for a `time`); `None` is naive (§1a, DV-4a); a timedelta (or subclass, checked against the cached `timedelta` type) strictly between −24 h and 24 h is the offset. A raising tzinfo is what `obj.utcoffset()` would propagate (DV-4b). Any other result asks `obj.utcoffset()` itself, whose answer — normally CPython's own error — is the truth (DV-15). `datetime.utcoffset()` builds its call from a format string (~40 ns per value; measured: aware datetimes 1.30× → 0.45× orjson).
 - **Interface:**
   ```rust
   // src/datetime.rs — pure
@@ -333,7 +333,7 @@ x86_64; a manual release gate)
   pub(crate) enum Dt64Err { Unrepresentable, GenericValue }    // → FR-7 (f) / (e)
   pub(crate) fn dt64_to_parts(v: i64, u: Dt64Unit) -> Result<Option<Parts>, Dt64Err>; // None = NaT; Err(Unrepresentable) → FR-7 (f); Err(GenericValue) → FR-7 (e)
   // src/encode.rs — Python side
-  unsafe fn utcoffset_of(&mut self, obj: *mut PyObject, what: &str) -> Result<Option<i64>, PyErrSet>; // obj.utcoffset() as total µs, DV-4b
+  unsafe fn utcoffset_of(&mut self, obj: *mut PyObject, tzinfo: *mut PyObject, arg: *mut PyObject, what: &str, delta: *mut PyTypeObject) -> Result<Option<i64>, PyErrSet>; // obj.utcoffset() as total µs, DV-4b
   unsafe fn datetime(&mut self, obj: *mut PyObject) -> bool;
   unsafe fn date(&mut self, obj: *mut PyObject) -> bool;
   unsafe fn time(&mut self, obj: *mut PyObject) -> bool;  // opts & !(NAIVE_UTC | UTC_Z)

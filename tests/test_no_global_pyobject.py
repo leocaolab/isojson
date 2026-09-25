@@ -4,9 +4,10 @@
     piece of shared runtime state is covered by a row of the README's
     "shared state" table;
 (2) the banned-symbol list — the single home of those bans (design E2E-9);
+(3) the README's "Differences from orjson" lists every design §1b DV id that
+    isn't a tombstone, and no other;
 (4) FR-1's traverse: cached types are visited by the module's `m_traverse`.
-Comments are skipped. Part (3) (the README's DV list) lands with the README
-rewrite (M4).
+Comments are skipped.
 """
 
 import datetime
@@ -136,6 +137,35 @@ def test_bans_leave_the_lookup_apis_alone():
 
 def test_comments_are_skipped():
     assert code_only("let x = 1; // writes into Out\n/* PyObject */") == "let x = 1; \n"
+
+
+# ---- (3) README mirrors design §1b's DV ids ---------------------------------
+
+DESIGN = ROOT / "docs" / "design" / "isojson-0.2-native-types.md"
+
+
+def design_dv_ids():
+    """Non-tombstone rows of the §1b table: `| DV-n | input | orjson | isojson |`
+    with an isojson cell (DV-2's merged row has none)."""
+    text = DESIGN.read_text(encoding="utf-8")
+    section = text[text.index("### 1b."): text.index("## 2.")]
+    ids = set()
+    for line in section.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if cells and re.fullmatch(r"DV-\d+[a-z]?", cells[0]) and len(cells) >= 4 and cells[3]:
+            ids.add(cells[0])
+    return ids
+
+
+def readme_dv_ids():
+    section = README[README.index("## Differences from orjson"): README.index("## Limitations")]
+    return set(re.findall(r"\bDV-\d+[a-z]?\b", section))
+
+
+def test_readme_lists_exactly_the_design_dv_rows():
+    design = design_dv_ids()
+    assert "DV-2" not in design and {"DV-1", "DV-4a", "DV-4b", "DV-17"} <= design, design
+    assert readme_dv_ids() == design, {"missing": design - readme_dv_ids(), "extra": readme_dv_ids() - design}
 
 
 # ---- (4) FR-1's traverse -----------------------------------------------------

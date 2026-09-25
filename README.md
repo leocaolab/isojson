@@ -213,9 +213,9 @@ isojson's own tests cover the case.
 | `OPT_STRICT_INTEGER`, `OPT_PASSTHROUGH_SUBCLASS` | ✅ | ✅ | — |
 | `loads` from `bytes` / `bytearray` / `memoryview` / `str` | ✅ | ✅ | `str`/`bytes` only |
 | Output bytes identical to orjson for the types above | ✅ | — | ❌ |
-| `datetime` / `date` / `time` serialized natively | ❌ → `default=` | ✅ | ❌ |
+| `datetime` / `date` / `time` natively, with `OPT_NAIVE_UTC`, `OPT_UTC_Z`, `OPT_OMIT_MICROSECONDS`, `OPT_PASSTHROUGH_DATETIME` | ✅ | ✅ | ❌ |
+| numpy arrays and scalars (`OPT_SERIALIZE_NUMPY`), incl. `datetime64` | ✅ (numpy ≥ 2) | ✅ | ❌ |
 | `uuid.UUID`, `enum.Enum`, dataclasses natively | ❌ → `default=` | ✅ | ❌ |
-| numpy arrays (`OPT_SERIALIZE_NUMPY`) | ❌ raises | ✅ | ❌ |
 | Non-`str` dict keys (`OPT_NON_STR_KEYS`) | ❌ raises | ✅ | ~ (coerced) |
 | `orjson.Fragment` | ❌ | ✅ | ❌ |
 | Integers beyond 64 bits in `dumps` | ❌ (like orjson) | ❌ | ✅ |
@@ -225,29 +225,79 @@ isojson's own tests cover the case.
 ## Differences from orjson
 
 These are all the known differences. Anything not listed produces the same
-result as orjson 3.12 (the test suite checks this, see [Testing](#testing)).
+result as orjson 3.12.0 (the test suite checks this, see [Testing](#testing)).
 
-- **Native `datetime`, `UUID`, `Enum`, dataclass, and numpy support is not
-  implemented yet.** Such objects go to your `default=` callable, the same as
-  any other unsupported type. Without a `default`, `dumps` raises
-  `TypeError: Type is not JSON serializable: <type>`, with the same message as
-  orjson.
-- **`OPT_NON_STR_KEYS` and `OPT_SERIALIZE_NUMPY` raise** `TypeError: isojson
-  does not support ...`. They are not silently ignored, because ignoring them
-  would produce output you did not ask for.
-- **Options that only affect datetimes and dataclasses are accepted and do
-  nothing:** `OPT_NAIVE_UTC`, `OPT_OMIT_MICROSECONDS`, `OPT_UTC_Z`,
-  `OPT_PASSTHROUGH_DATETIME`, `OPT_PASSTHROUGH_DATACLASS`. isojson never
-  serializes those types natively, so these options can have no effect.
-  `OPT_SERIALIZE_DATACLASS` and `OPT_SERIALIZE_UUID` are `0`, as in orjson.
+### Where orjson crashes or writes wrong data
+
+isojson writes what Python's own API says the value is: `isoformat()` for
+`datetime` / `date` / `time` (after the options are applied), and for
+`datetime64` the meaning numpy's API defines (`v × mult` units since 1970,
+sub-µs floored to µs). What has no answer in that format is *declined* (next
+section). Each row has a regression test that proves both halves.
+
+| # | Input | orjson 3.12.0 | isojson |
+|---|---|---|---|
+| DV-1 | UTC offset with seconds or microseconds (`+05:59:30`, `-00:00:01`, New York before 1883 = `-04:56:02`) | rounds to the minute without carrying: `+05:60`, `-00:00` (sign lost), `-04:56` | `isoformat()`'s offset, exactly |
+| DV-3 | pytz datetime after arithmetic, not normalized | the normalized offset on the un-normalized wall time (a different instant) | `dt.utcoffset()` |
+| DV-4a | a tzinfo whose `utcoffset()` returns `None` | an invented offset (`+00:00` on macOS / x86_64 Linux, garbage such as `+18:12` on aarch64 Linux) | no offset: naive to Python |
+| DV-4b | `utcoffset()` raises (datetime) / is invalid (time) | datetime: crashes (SIGSEGV) | `TypeError("datetime.utcoffset() raised …")`, the exception as `__cause__` |
+| DV-5 | `datetime64` NaT in `ns` | `"1677-09-21T00:12:43.145224"` | `null` |
+| DV-6 | NaT in `W D h m` | `"1970-01-01T00:00:00"` | `null` |
+| DV-7 | NaT in `Y M s ms us`, and generic NaT | `TypeError` | `null` |
+| DV-8 | multiplied units (`M8[10ms]`, `M8[2D]`) | crashes (`unreachable!()`) | value × multiplier |
+| DV-9 | `M8[M]` before 1970 | crashes / `TypeError` | floor division (`1969-12-01T00:00:00`) |
+| DV-10 | `M8[D…us]` from `9999-12-30T22:00` to `9999-12-31` | `TypeError` | written |
+| DV-11 | values whose seconds overflow i64 (`M8[m]` 307445734561825861) | a wrapped, wrong value | declined |
+| DV-12 | `datetime.time` with `tzinfo` | `TypeError` | `t.isoformat()`: `"01:00:00+00:00"` |
+| DV-13 | generic-unit `M8` holding a value | `TypeError: … unit: NaT` (misnames it) | declined |
+| DV-14 | ≥2-D `M8` arrays with an element orjson's 1-D writer rejects | **malformed JSON, no error, even with `default`** (`[[,[…]]`) | per the rows above |
+| DV-15 | `utcoffset()` returns a non-timedelta or ≥ 24 h | an invented or garbage offset | `TypeError`, as `dt.utcoffset()` raises |
+| DV-16 | `datetime64` in `ps`, `fs`, `as` | `TypeError`, even with `default` | floored to µs |
+| DV-17 | a `time` whose microsecond has five digits (`time(0, 0, 1, 75652)`) | drops the leading zero: `"00:00:01.75652"` | `"00:00:01.075652"` |
+
+### Declined numpy objects
+
+A numpy object isojson can't write — a non-C-contiguous or non-native-endian
+array, a 0-d array, an unsupported dtype, a generic-unit value, an
+unrepresentable `datetime64` — goes **whole** to `default=` when one is given.
+A decline found mid-array rolls the output back first, so `default` gets the
+array, not a half-written one. Without `default`, `dumps` raises orjson's
+message for the reason, with a note (`add_note`) carrying the raw evidence
+(`dtype.str`, flags, shape, value). orjson sends some of these to `default`
+too, but raises for non-native-endian arrays and out-of-range `datetime64`
+even with a `default`. Unrecognized numpy scalars (`complex128`,
+`longdouble`) take the ordinary `default` path. Unaligned C-contiguous arrays
+(`np.frombuffer(…, offset=1)`) are read correctly (orjson's typed-slice read
+is undefined behaviour there).
+
+### Kept from 0.1
+
+- **`uuid.UUID`, `enum.Enum`, dataclasses and `orjson.Fragment`** go to
+  `default=` (or raise `Type is not JSON serializable`).
+- **`OPT_NON_STR_KEYS` raises** `TypeError: isojson does not support
+  OPT_NON_STR_KEYS`, rather than being silently ignored.
+  `OPT_PASSTHROUGH_DATACLASS` is accepted and does nothing (isojson never
+  serializes dataclasses); `OPT_SERIALIZE_DATACLASS` and `OPT_SERIALIZE_UUID`
+  are `0`, as in orjson.
+- **`default=None`** means "no default". orjson calls `None` and raises
+  `Type is not JSON serializable` with a `'NoneType' object is not callable`
+  cause.
+- **Argument errors** (`dumps()` with no object, unknown keywords) have
+  different wording.
 - **`loads` error messages differ.** The exception type (`JSONDecodeError`,
   a subclass of `json.JSONDecodeError` and `ValueError`) and `.pos` / `.lineno`
   / `.colno` match. The wording of `.msg` does not always match orjson's.
+
+## Limitations
+
 - **CPython 3.14 only.** Per-interpreter GIL arrived in 3.12, but 3.12's
   and 3.13's own `_datetime` isn't usable from concurrent strict
-  sub-interpreters, so isojson targets 3.14. On free-threaded builds (3.14t)
-  the module declares that it needs the
+  sub-interpreters, so isojson targets 3.14.
+- **Free-threaded builds (3.14t):** the module declares that it needs the
   GIL, so CPython re-enables it on import (see above).
+- **numpy:** `OPT_SERIALIZE_NUMPY` is tested with numpy ≥ 2. isojson reads
+  arrays through `__array_struct__` and never imports numpy; it uses the
+  numpy the calling interpreter already has in `sys.modules`.
 
 ## Performance
 
@@ -366,9 +416,11 @@ both.
 ## Testing
 
 ```bash
-pip install maturin pytest orjson
+pip install maturin
+pip install -e ".[test]"      # pytest, orjson==3.12.0, numpy>=2, pytz, tzdata
 maturin develop --release
 pytest tests
+cargo test --lib              # the pure Rust core
 ```
 
 - **Parity with orjson** (`tests/test_parity.py`):
@@ -396,19 +448,43 @@ pytest tests
 - **Threads** (`tests/test_threads.py`): 8 threads in one interpreter, and
   4 threads plus 4 sub-interpreters at the same time, each worker on its own
   seeded data with its own expected answer.
+- **datetime and numpy** (0.2):
+  - byte parity with orjson for every datetime option combination, numpy
+    dtypes × shapes × `default` × `OPT_INDENT_2`, and random documents
+    (`tests/test_parity_types.py`);
+  - one regression per [difference](#differences-from-orjson), proving
+    orjson's failure, the Python-API reference, and isojson's match; the
+    crash rows run in child processes (`tests/test_divergence.py`);
+  - the Python API as the oracle: `isoformat()` / `fromisoformat()` round
+    trips, and `datetime64` in every unit × multiplier across the i64 range
+    against the exact integer meaning (`tests/test_stdlib_oracle.py`);
+  - every decline rule, rollback, notes, and unaligned arrays
+    (`tests/test_declines.py`); all 65,536 float16 values bit-exactly
+    (`tests/test_f16.py`); a replaced `sys.modules["numpy"]`
+    (`tests/test_numpy_swap.py`);
+  - reentrancy: `utcoffset()` mutating the container being written, under
+    `PYTHONMALLOC=debug` (`tests/test_reentrancy.py`); concurrent
+    sub-interpreters writing datetimes (`tests/test_concurrency_dt.py`);
+  - no process-global Python state: every `static` reviewed, banned symbols,
+    cached types traversed by the GC (`tests/test_no_global_pyobject.py`).
+- **Per-worker numpy in Pyronova**: Pyronova's
+  `tests/test_isojson_numpy_workers.py` runs 4 workers, each with its own
+  numpy copy, against orjson's bytes.
 
 The suite passes on macOS arm64 and Linux x86_64, both normally and under
 `PYTHONMALLOC=debug`. The `-X dev` / `PYTHONDEVMODE=1` run is on Linux.
 
 ## Status
 
-Version 0.1.0. The API is stable (it is orjson's). Native `datetime`, `UUID`,
-`Enum`, and dataclass support is next.
+Version 0.2.0: native `datetime` / `date` / `time` and numpy. The API is
+stable (it is orjson's). `UUID`, `Enum` and dataclass support is next.
 
 ## License
 
 Apache-2.0.
 
-Third-party: simd-json (Apache-2.0 OR MIT); `tests/data/JSONTestSuite` is from
+Third-party: simd-json (Apache-2.0 OR MIT); the float16 → float32
+conversion is half-rs's `f16_to_f32_fallback` as shipped in orjson
+(Apache-2.0 OR MIT, attribution in `src/float.rs`); `tests/data/JSONTestSuite` is from
 [nst/JSONTestSuite](https://github.com/nst/JSONTestSuite) (MIT, license
 included in that directory).

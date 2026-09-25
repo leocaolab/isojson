@@ -161,6 +161,20 @@ unsafe fn add_note(note: &str) {
     PyErr_SetRaisedException(exc);
 }
 
+/// `None` → `None`; a timedelta → its total µs. Consumes the reference.
+unsafe fn delta_us(r: *mut PyObject) -> Option<i64> {
+    let out = if r == Py_None() {
+        None
+    } else {
+        let days = PyDateTime_DELTA_GET_DAYS(r) as i64;
+        let secs = PyDateTime_DELTA_GET_SECONDS(r) as i64;
+        let us = PyDateTime_DELTA_GET_MICROSECONDS(r) as i64;
+        Some((days * 86_400 + secs) * 1_000_000 + us)
+    };
+    Py_DECREF(r);
+    out
+}
+
 #[inline]
 pub(crate) fn write_int<I: itoa::Integer>(out: &mut Out, v: I) {
     let mut b = itoa::Buffer::new();
@@ -319,11 +333,11 @@ impl Encoder {
             return None;
         }
         if ty == dt.datetime {
-            Some(self.datetime(obj))
+            Some(self.datetime(obj, dt))
         } else if ty == dt.date {
             Some(self.date(obj))
         } else if ty == dt.time {
-            Some(self.time(obj))
+            Some(self.time(obj, dt))
         } else {
             None
         }
@@ -416,42 +430,73 @@ impl Encoder {
 
     /// `obj.utcoffset()` as total µs; `None` when naive (design §1a). The
     /// tzinfo field is read first, so naive objects call no method (D7).
-    /// The value is CPython's validated one: `datetime.utcoffset()` itself
-    /// raises unless its tzinfo returned `None` or a timedelta under 24 h.
-    /// A raising `utcoffset()` becomes DV-4b's `TypeError`, with the
-    /// exception as `__cause__`.
+    ///
+    /// This is CPython's own `call_tzinfo_method` done inline:
+    /// `tzinfo.utcoffset(arg)` (`arg` is the datetime, or `None` for a
+    /// `time`), then `None` passes, and a timedelta (or subclass) must lie
+    /// strictly between −24 h and 24 h. `datetime.utcoffset()` builds that call
+    /// from a format string, which costs about 40 ns per value.
+    ///
+    /// A raising tzinfo is exactly what `obj.utcoffset()` would propagate;
+    /// it becomes DV-4b's `TypeError`, with the exception as `__cause__`. For
+    /// an invalid result (DV-15), `obj.utcoffset()` itself is asked, so the
+    /// error is CPython's own, word for word; that path calls the tzinfo a
+    /// second time.
     unsafe fn utcoffset_of(
         &mut self,
         obj: *mut PyObject,
         tzinfo: *mut PyObject,
+        arg: *mut PyObject,
         what: &str,
+        delta: *mut PyTypeObject,
     ) -> R<Option<i64>> {
         if tzinfo == Py_None() {
             return Ok(None);
         }
         debug_assert!(self.guard);
-        let r = PyObject_CallMethodNoArgs(obj, (*self.cache).names.utcoffset);
+        let names = &(*self.cache).names;
+        let r = PyObject_CallMethodOneArg(tzinfo, names.utcoffset, arg);
         if r.is_null() {
-            let cause = PyErr_GetRaisedException();
-            let msg = format!("{what}.utcoffset() raised {}", describe_exception(cause));
-            raise_type_error_caused_by(&msg, cause);
-            return Err(PyErrSet);
+            return Err(self.utcoffset_raised(what));
         }
         if r == Py_None() {
-            Py_DECREF(r);
-            return Ok(None);
+            return Ok(delta_us(r));
         }
-        let days = PyDateTime_DELTA_GET_DAYS(r) as i64;
-        let secs = PyDateTime_DELTA_GET_SECONDS(r) as i64;
-        let us = PyDateTime_DELTA_GET_MICROSECONDS(r) as i64;
+        // CPython's bounds: strictly between -timedelta(1) and timedelta(1)
+        if PyObject_TypeCheck(r, delta) != 0 {
+            let days = PyDateTime_DELTA_GET_DAYS(r);
+            if days == 0
+                || (days == -1
+                    && (PyDateTime_DELTA_GET_SECONDS(r) != 0
+                        || PyDateTime_DELTA_GET_MICROSECONDS(r) != 0))
+            {
+                return Ok(delta_us(r));
+            }
+        }
         Py_DECREF(r);
-        Ok(Some((days * 86_400 + secs) * 1_000_000 + us))
+        // invalid: ask `obj.utcoffset()`, whose answer is the truth (§1a) —
+        // normally CPython's own error for it
+        let r = PyObject_CallMethodNoArgs(obj, names.utcoffset);
+        if r.is_null() {
+            return Err(self.utcoffset_raised(what));
+        }
+        Ok(delta_us(r))
+    }
+
+    /// DV-4b: `TypeError("<what>.utcoffset() raised <Exc>: <msg>")` from the
+    /// exception being raised, which becomes its `__cause__`.
+    unsafe fn utcoffset_raised(&mut self, what: &str) -> PyErrSet {
+        let cause = PyErr_GetRaisedException();
+        let msg = format!("{what}.utcoffset() raised {}", describe_exception(cause));
+        raise_type_error_caused_by(&msg, cause);
+        PyErrSet
     }
 
     /// `dt.isoformat()` after `NAIVE_UTC` / `OMIT_MICROSECONDS`, with a zero
     /// offset written `Z` under `UTC_Z` (design §1a, FR-5).
-    unsafe fn datetime(&mut self, obj: *mut PyObject) -> bool {
-        let offset = match self.utcoffset_of(obj, PyDateTime_DATE_GET_TZINFO(obj), "datetime") {
+    unsafe fn datetime(&mut self, obj: *mut PyObject, dt: DtTypes) -> bool {
+        let tzinfo = PyDateTime_DATE_GET_TZINFO(obj);
+        let offset = match self.utcoffset_of(obj, tzinfo, obj, "datetime", dt.delta) {
             Ok(Some(o)) => Some(o),
             Ok(None) if self.opts & OPT_NAIVE_UTC != 0 => Some(0),
             Ok(None) => None,
@@ -485,9 +530,10 @@ impl Encoder {
 
     /// `t.isoformat()` after `OMIT_MICROSECONDS`, with its offset if it has
     /// one (DV-12). `NAIVE_UTC` and `UTC_Z` don't apply to `time`.
-    unsafe fn time(&mut self, obj: *mut PyObject) -> bool {
+    unsafe fn time(&mut self, obj: *mut PyObject, dt: DtTypes) -> bool {
         let opts = self.opts & !(OPT_NAIVE_UTC | OPT_UTC_Z);
-        let offset = match self.utcoffset_of(obj, PyDateTime_TIME_GET_TZINFO(obj), "time") {
+        let tzinfo = PyDateTime_TIME_GET_TZINFO(obj);
+        let offset = match self.utcoffset_of(obj, tzinfo, Py_None(), "time", dt.delta) {
             Ok(o) => o,
             Err(PyErrSet) => return false,
         };

@@ -3,6 +3,9 @@
     python bench/bench.py            # everything, markdown tables on stdout
     python bench/bench.py single     # single-interpreter dumps/loads only
     python bench/bench.py parallel   # multi-interpreter scaling only
+    python bench/bench.py nfr --baseline PY
+                                     # design NFR-1…5 with pass/fail; PY is a
+                                     # Python with isojson 0.1 (NFR-1, NFR-5)
 
 Method: every cell is repeated and reported as the median, because one shot
 is not a result. Parallel cells time only the work loop — interpreter /
@@ -273,9 +276,113 @@ def parallel():
         print(f"\n{note}")
 
 
+# --------------------------------------------------------------------------
+# NFRs (design §4): each a ratio against a threshold
+# --------------------------------------------------------------------------
+
+
+def _median(fn):
+    return bench(fn, calibrate(fn))[0]
+
+
+def baseline_cells():
+    """Median seconds for the cells 0.1 can run: every single() cell (NFR-1)
+    and NFR-5's `default` path without the numpy option. Run by --baseline."""
+    import datetime  # noqa: F401  (0.2's guard is on once datetime is loaded)
+
+    cells = {}
+    for name, obj in payloads().items():
+        raw = orjson.dumps(obj)
+        cells[f"dumps {name}"] = _median(lambda obj=obj: isojson.dumps(obj))
+        cells[f"loads {name}"] = _median(lambda raw=raw: isojson.loads(raw))
+    objs = [object()] * 1000
+    cells["nfr5"] = _median(lambda: isojson.dumps(objs, default=str))
+    return cells
+
+
+def nfr_payloads():
+    import datetime as dt
+
+    import numpy as np
+
+    r = random.Random(3)
+    tz = dt.timezone(dt.timedelta(hours=8))
+    base = dt.datetime(2026, 9, 24, 12, 30, 15, 123456)
+    records = [
+        {"id": i, "created": base + dt.timedelta(seconds=i),
+         "updated": (base + dt.timedelta(minutes=i)).replace(tzinfo=tz),
+         "seen": (base - dt.timedelta(hours=i)).replace(tzinfo=dt.timezone.utc if i % 2 else None)}
+        for i in range(2000)
+    ]
+    rng = np.random.default_rng(3)
+    return {
+        "NFR-2": [("datetime records 2000 × 3", records, 0)],
+        "NFR-3": [
+            ("numpy f64 ×1M", rng.random(1_000_000), None),
+            ("numpy f64 1000×1000", rng.random((1000, 1000)), None),
+            ("numpy i64 ×1M", rng.integers(-(2**62), 2**62, 1_000_000), None),
+        ],
+        "NFR-4": [
+            ("10k numpy f64 scalars", [np.float64(r.random()) for _ in range(10_000)], None),
+            ("10k numpy i64 scalars", [np.int64(r.randrange(-(2**40), 2**40)) for _ in range(10_000)], None),
+        ],
+    }
+
+
+def nfr(baseline_python):
+    import json as _json
+    import subprocess
+
+    import numpy as np  # noqa: F401  (NFR-5: numpy loaded)
+
+    NUMPY = isojson.OPT_SERIALIZE_NUMPY
+    limits = {"NFR-1": 0.03, "NFR-2": 1.2, "NFR-3": 1.2, "NFR-4": 1.3, "NFR-5": 1.10}
+    rows = []
+    for nfr_id, cases in nfr_payloads().items():
+        for name, obj, _ in cases:
+            opt = 0 if nfr_id == "NFR-2" else NUMPY
+            a = _median(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt))
+            b = _median(lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
+            rows.append((nfr_id, name, "orjson", a, b, a / b <= limits[nfr_id]))
+
+    out = subprocess.run([baseline_python, __file__, "baseline-cells"], capture_output=True, text=True, check=True)
+    base = _json.loads(out.stdout.strip().splitlines()[-1])
+    base_version = out.stdout.strip().splitlines()[0]
+    mine = baseline_cells()
+    for key, old in base.items():
+        if key == "nfr5":
+            continue
+        new = mine[key]
+        rows.append(("NFR-1", key, base_version, new, old, abs(new / old - 1) <= limits["NFR-1"]))
+    objs = [object()] * 1000
+    new5 = _median(lambda: isojson.dumps(objs, default=str, option=NUMPY))
+    rows.append(("NFR-5", "[object()]*1000, default=str, numpy loaded", base_version + " (no option)",
+                 new5, base["nfr5"], new5 / base["nfr5"] <= limits["NFR-5"]))
+
+    print(f"\n### Design NFRs (median of {REPEAT}; ratio = isojson 0.2 / reference)\n")
+    print("| NFR | payload | reference | isojson | reference | ratio | threshold | |")
+    print("|---|---|---|---:|---:|---:|---|---|")
+    thresholds = {"NFR-1": "within ±3%", "NFR-2": "≤ 1.2×", "NFR-3": "≤ 1.2×", "NFR-4": "≤ 1.3×", "NFR-5": "≤ 1.10×"}
+    for nfr_id, name, ref, a, b, ok in rows:
+        print(f"| {nfr_id} | {name} | {ref} | {fmt_time(a)} | {fmt_time(b)} | {a / b:.2f}× | "
+              f"{thresholds[nfr_id]} | {'pass' if ok else '**FAIL**'} |")
+    print("\nNFR-6 (concurrency) is E2E-6: `pytest tests/test_concurrency_dt.py`.")
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["baseline-cells"]:
+        import json as _json
+
+        print(f"isojson {isojson.__version__}")
+        print(_json.dumps(baseline_cells()))
+        sys.exit(0)
     print(f"Python {sys.version.split()[0]} · isojson {isojson.__version__} · orjson {orjson.__version__}")
     what = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if what == "nfr":
+        if "--baseline" not in sys.argv:
+            sys.exit("nfr needs --baseline PYTHON (a Python with isojson 0.1 and orjson)")
+        nfr(sys.argv[sys.argv.index("--baseline") + 1])
+        sys.exit(0)
     if what in ("all", "single"):
         single()
     if what in ("all", "parallel"):

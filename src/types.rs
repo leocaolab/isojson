@@ -23,6 +23,8 @@ pub(crate) struct DtTypes {
     pub(crate) datetime: *mut PyTypeObject,
     pub(crate) date: *mut PyTypeObject,
     pub(crate) time: *mut PyTypeObject,
+    /// `timedelta`: `utcoffset()` results are checked against it (FR-5).
+    pub(crate) delta: *mut PyTypeObject,
 }
 
 /// The numpy group: `ndarray` and the 13 scalar types isojson writes (FR-8),
@@ -222,8 +224,9 @@ impl TypeCache {
             datetime: (*api).DateTimeType,
             date: (*api).DateType,
             time: (*api).TimeType,
+            delta: (*api).DeltaType,
         };
-        for t in [dt.datetime, dt.date, dt.time] {
+        for t in [dt.datetime, dt.date, dt.time, dt.delta] {
             Py_INCREF(t.cast());
         }
         self.dt = dt;
@@ -297,12 +300,13 @@ impl TypeCache {
                 }
             }
         }
-        let held: [*mut PyObject; 12] = [
+        let held: [*mut PyObject; 13] = [
             self.np_module,
             self.dt_capsule,
             self.dt.datetime.cast(),
             self.dt.date.cast(),
             self.dt.time.cast(),
+            self.dt.delta.cast(),
             self.names.datetime_mod,
             self.names.numpy,
             self.names.datetime_capi,
@@ -328,6 +332,7 @@ impl TypeCache {
         release(&mut self.dt.datetime);
         release(&mut self.dt.date);
         release(&mut self.dt.time);
+        release(&mut self.dt.delta);
         self.clear_numpy();
         for (slot, _) in self.names.slots() {
             release(slot);
