@@ -6,7 +6,8 @@
     python bench/bench.py parallel   # multi-interpreter scaling only
     python bench/bench.py nfr --baseline PY
                                      # design NFR-1…5 with pass/fail; PY is a
-                                     # Python with isojson 0.1 (NFR-1, NFR-5)
+                                     # Python with isojson 0.1, orjson and
+                                     # numpy (NFR-1, NFR-5)
 
 Method: every cell is repeated and reported as the median, because one shot
 is not a result. Parallel cells time only the work loop — interpreter /
@@ -307,10 +308,19 @@ def baseline_cells():
         raw = orjson.dumps(obj)
         cells[f"dumps {name}"] = _median(lambda obj=obj: isojson.dumps(obj))
         cells[f"loads {name}"] = _median(lambda raw=raw: isojson.loads(raw))
-    import numpy  # noqa: F401  (NFR-5 compares with numpy loaded on both sides; it slows `str` on 0.1 too)
+    # NFR-5 with numpy loaded, as it is for the numpy option (importing numpy
+    # slows the default path on 0.1 too)
+    import numpy  # noqa: F401
 
     objs = [object()] * 1000
     cells["nfr5"] = _median(lambda: isojson.dumps(objs, default=str))
+    try:
+        numpy_opt = isojson.OPT_SERIALIZE_NUMPY
+        isojson.dumps(objs, default=str, option=numpy_opt)
+    except TypeError:  # 0.1: the option raises
+        pass
+    else:
+        cells["nfr5 numpy option"] = _median(lambda: isojson.dumps(objs, default=str, option=numpy_opt))
     return cells
 
 
@@ -361,8 +371,6 @@ def nfr(baseline_python):
     import json as _json
     import subprocess
 
-    import numpy as np  # noqa: F401  (NFR-5: numpy loaded)
-
     NUMPY = isojson.OPT_SERIALIZE_NUMPY
     limits = {"NFR-1": 0.03, "NFR-2": 1.2, "NFR-3": 1.2, "NFR-4": 1.3, "NFR-5": 1.10}
     rows = []
@@ -373,17 +381,23 @@ def nfr(baseline_python):
                          lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
             rows.append((nfr_id, name, "orjson", a, b, a / b <= limits[nfr_id]))
 
-    out = subprocess.run([baseline_python, __file__, "baseline-cells"], capture_output=True, text=True, check=True)
-    base = _json.loads(out.stdout.strip().splitlines()[-1])
-    base_version = out.stdout.strip().splitlines()[0]
-    mine = baseline_cells()
+    def cells_of(python):
+        """The 0.1-comparable cells, measured in a fresh process: both
+        versions run the same steps in the same environment."""
+        out = subprocess.run([python, __file__, "baseline-cells"], capture_output=True, text=True)
+        if out.returncode != 0:
+            sys.exit(f"cell run failed ({python}):\n{out.stderr.strip()}")
+        lines = out.stdout.strip().splitlines()
+        return lines[0], _json.loads(lines[-1])
+
+    base_version, base = cells_of(baseline_python)
+    _, mine = cells_of(sys.executable)
     for key, old in base.items():
         if key == "nfr5":
             continue
         new = mine[key]
         rows.append(("NFR-1", key, base_version, new, old, abs(new / old - 1) <= limits["NFR-1"]))
-    objs = [object()] * 1000
-    new5 = _median(lambda: isojson.dumps(objs, default=str, option=NUMPY))
+    new5 = mine["nfr5 numpy option"]
     rows.append(("NFR-5", "[object()]*1000, default=str, numpy loaded", base_version + " (no option)",
                  new5, base["nfr5"], new5 / base["nfr5"] <= limits["NFR-5"]))
 
