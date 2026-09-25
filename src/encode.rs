@@ -261,6 +261,13 @@ impl Encoder {
         if ty == &raw mut PyTuple_Type {
             return self.tuple(obj);
         }
+        self.serialize_other(obj, ty)
+    }
+
+    /// Everything past the exact builtins: datetimes, subclasses, numpy and
+    /// `default`, out of line so `serialize` stays as small as 0.1's.
+    #[inline(never)]
+    unsafe fn serialize_other(&mut self, obj: *mut PyObject, ty: *mut PyTypeObject) -> bool {
         if let Some(dt) = self.dt {
             if let Some(ok) = self.datetime_like(obj, ty, dt) {
                 return ok;

@@ -2,6 +2,7 @@
 
     python bench/bench.py            # everything, markdown tables on stdout
     python bench/bench.py single     # single-interpreter dumps/loads only
+    python bench/bench.py types      # datetime and numpy dumps vs orjson
     python bench/bench.py parallel   # multi-interpreter scaling only
     python bench/bench.py nfr --baseline PY
                                      # design NFR-1…5 with pass/fail; PY is a
@@ -329,6 +330,20 @@ def nfr_payloads():
     }
 
 
+def types():
+    """`dumps` of the 0.2 types, isojson vs orjson (json can't write them)."""
+    NUMPY = isojson.OPT_SERIALIZE_NUMPY
+    print(f"\n### dumps of datetime and numpy (single interpreter, median of {REPEAT}; lower is better)\n")
+    print("| payload | isojson | orjson | isojson / orjson |")
+    print("|---|---:|---:|---:|")
+    for nfr_id, cases in nfr_payloads().items():
+        for name, obj, _ in cases:
+            opt = 0 if nfr_id == "NFR-2" else NUMPY
+            a = _median(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt))
+            b = _median(lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
+            print(f"| {name} | {fmt_time(a)} | {fmt_time(b)} | {a / b:.2f}× |")
+
+
 def nfr(baseline_python):
     import json as _json
     import subprocess
@@ -385,5 +400,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if what in ("all", "single"):
         single()
+    if what in ("all", "types"):
+        types()
     if what in ("all", "parallel"):
         parallel()

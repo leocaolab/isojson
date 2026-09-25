@@ -193,10 +193,17 @@ impl TypeCache {
     /// The datetime group, loaded on first use (design §8.1). Absent when
     /// `_datetime` is not in `sys.modules`, is not a module, or has no valid
     /// `datetime_CAPI` capsule; retried on the next call.
+    #[inline(always)]
     pub(crate) unsafe fn datetime(&mut self) -> R<Option<DtTypes>> {
         if !self.dt_capsule.is_null() {
             return Ok(Some(self.dt));
         }
+        self.load_datetime()
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn load_datetime(&mut self) -> R<Option<DtTypes>> {
         if self.names.datetime_mod.is_null() {
             return Ok(None);
         }

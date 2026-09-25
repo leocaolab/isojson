@@ -357,8 +357,24 @@ How to read this:
 | floats ×10k | 224.24 µs | 199.21 µs | 1.14 ms | 1.13× |
 | unicode/escapes ×200 | 94.63 µs | 68.32 µs | 171.29 µs | 1.39× |
 
-In summary: `dumps` is within 1.2× of orjson and about 2× faster on
-float-heavy documents. `loads` is 1.1–1.6× slower than orjson. Both are
+**datetime and numpy** (`dumps`; `python bench/bench.py types`):
+
+| payload | isojson | orjson | isojson / orjson |
+|---|---:|---:|---:|
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 188.13 µs | 247.69 µs | **0.76×** |
+| numpy `float64` × 1M | 15.98 ms | 22.69 ms | **0.70×** |
+| numpy `float64` 1000 × 1000 | 15.69 ms | 22.76 ms | **0.69×** |
+| numpy `int64` × 1M | 7.63 ms | 6.97 ms | 1.09× |
+| 10k numpy `float64` scalars | 215.48 µs | 319.47 µs | **0.67×** |
+| 10k numpy `int64` scalars | 119.54 µs | 159.66 µs | **0.75×** |
+
+Aware datetimes are faster than orjson's because the offset comes from one
+`tzinfo.utcoffset(dt)` call, checked the way CPython checks it, while orjson
+probes the tzinfo's attributes first. `float64` arrays and scalars share the
+float writer that makes float-heavy documents fast.
+
+In summary: `dumps` is within 1.2× of orjson on plain JSON, about 2× faster on
+float-heavy documents, and faster on datetimes and numpy `float64`. `loads` is 1.1–1.6× slower than orjson. Both are
 1.5–21× faster than stdlib `json`.
 
 The remaining `loads` gap is mostly fixed per-call cost around simd-json:
