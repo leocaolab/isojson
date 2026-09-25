@@ -5,22 +5,28 @@
 //! in process-global storage.** Everything that must outlive a call lives in
 //! the module's per-interpreter state (`ModState`), which CPython allocates
 //! once per interpreter and tears down with it. The only process-global
-//! pointers we touch are CPython's static builtin types and the immortal
-//! singletons (`None`/`True`/`False`), which every interpreter shares by
-//! design and never refcounts.
+//! pointers we touch are CPython's static builtin types, `_datetime`'s static
+//! types and C-API struct, and the immortal singletons (`None`/`True`/
+//! `False`), which every interpreter shares by design.
 //!
 //! Multi-phase init (PEP 489) + `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` means
 //! the module loads in strict own-GIL sub-interpreters with no override.
 
+#[cfg(not(Py_3_14))]
+compile_error!("isojson requires CPython 3.14");
 #[cfg(Py_3_15)]
 compile_error!("isojson does not support Python 3.15 yet (PyModExport init is not wired)");
 
+mod datetime;
+mod decline;
 mod decode;
 mod encode;
 mod float;
+mod numpy;
 mod out;
 mod strfast;
 mod swar;
+mod types;
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
@@ -35,7 +41,14 @@ pub(crate) struct ModState {
     pub(crate) decode_error: *mut PyObject,
     /// Recently seen dict keys for `loads` — this interpreter's objects only.
     pub(crate) key_cache: *mut decode::KeyCache,
+    /// Types looked up in this interpreter's `sys.modules` (design C1).
+    pub(crate) types: types::TypeCache,
 }
+
+/// A Python exception is already set (e.g. MemoryError).
+pub(crate) struct PyErrSet;
+
+pub(crate) type R<T> = Result<T, PyErrSet>;
 
 #[inline]
 pub(crate) unsafe fn state(module: *mut PyObject) -> *mut ModState {
@@ -65,6 +78,9 @@ unsafe extern "C" fn module_exec(m: *mut PyObject) -> c_int {
     let st = state(m);
     (*st).decode_error = ptr::null_mut();
     (*st).key_cache = Box::into_raw(decode::KeyCache::new());
+    if (*st).types.init() < 0 {
+        return -1;
+    }
 
     // Subclass this interpreter's json.JSONDecodeError, so `except
     // json.JSONDecodeError` / `except ValueError` both catch ours.
@@ -140,13 +156,16 @@ unsafe extern "C" fn module_traverse(
     arg: *mut c_void,
 ) -> c_int {
     let st = state(m);
-    if !st.is_null() && !(*st).decode_error.is_null() {
+    if st.is_null() {
+        return 0;
+    }
+    if !(*st).decode_error.is_null() {
         let r = visit((*st).decode_error, arg);
         if r != 0 {
             return r;
         }
     }
-    0
+    (*st).types.traverse(visit, arg)
 }
 
 unsafe extern "C" fn module_clear(m: *mut PyObject) -> c_int {
@@ -162,6 +181,7 @@ unsafe extern "C" fn module_clear(m: *mut PyObject) -> c_int {
     if !(*st).key_cache.is_null() {
         (*(*st).key_cache).clear();
     }
+    (*st).types.clear();
     0
 }
 
@@ -198,9 +218,7 @@ static mut METHODS: [PyMethodDef; 3] = [
     PyMethodDef::zeroed(),
 ];
 
-const SLOTS_LEN: usize = 3 + cfg!(Py_3_13) as usize;
-
-static mut SLOTS: [PyModuleDef_Slot; SLOTS_LEN] = [
+static mut SLOTS: [PyModuleDef_Slot; 4] = [
     PyModuleDef_Slot {
         slot: Py_mod_exec,
         value: module_exec as *mut c_void,
@@ -212,7 +230,6 @@ static mut SLOTS: [PyModuleDef_Slot; SLOTS_LEN] = [
     // Free-threaded builds: we iterate dicts/lists with borrowed refs, which
     // is only safe under a GIL. Declare that honestly instead of claiming
     // GIL_NOT_USED.
-    #[cfg(Py_3_13)]
     PyModuleDef_Slot {
         slot: Py_mod_gil,
         value: Py_MOD_GIL_USED,

@@ -18,13 +18,8 @@ use core::ptr;
 use pyo3_ffi::*;
 use simd_json::{Buffers, ErrorType, Node, StaticNode};
 
-use crate::state;
 use crate::swar;
-
-/// A Python exception is already set (e.g. MemoryError).
-struct PyErrSet;
-
-type R<T> = Result<T, PyErrSet>;
+use crate::{state, PyErrSet, R};
 
 thread_local! {
     /// Per-thread parser scratch: a mutable copy of the input (simd-json

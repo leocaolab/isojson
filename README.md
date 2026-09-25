@@ -20,7 +20,7 @@ ImportError: module orjson.orjson does not support loading in subinterpreters
 pip install isojson
 ```
 
-Wheels are published for CPython 3.12, 3.13 and 3.14 on Linux (x86_64,
+Wheels are published for CPython 3.14 on Linux (x86_64,
 aarch64), macOS (arm64, x86_64) and Windows (x86_64).
 
 ```python
@@ -60,14 +60,15 @@ plain data, never a Python object:
 
 | shared state | what it is |
 |---|---|
-| per-thread scratch buffers | bytes only (`thread_local!`) |
+| per-thread scratch buffers and size hints | bytes and sizes only (`thread_local!`) |
 | simd-json's CPU-feature detection | an atomic set once per process |
 | the `str` fast-path switch | an atomic, set by an import-time self-check that gives the same result in every interpreter |
 
 Every Python object isojson keeps longer than one call lives in
-per-interpreter module state. That is the `JSONDecodeError` type and the
-dict-key cache. CPython creates it for each interpreter and frees it with
-that interpreter.
+per-interpreter module state. That is the `JSONDecodeError` type, the
+dict-key cache, and the type cache (the `datetime` types, looked up in that
+interpreter's own `sys.modules`, never imported). CPython creates it for each
+interpreter and frees it with that interpreter.
 
 **How this is tested:** strict import in 6 own-GIL sub-interpreters, with no
 override; 4 and 8 sub-interpreters running concurrently; 8 threads in one
@@ -78,7 +79,7 @@ worker checks its own seeded data against its own expected answer, so a
 leak between threads or interpreters shows up as a wrong result, not just
 as a crash that may or may not happen.
 
-**Free-threaded CPython (3.13t / 3.14t):** isojson works there, but it is
+**Free-threaded CPython (3.14t):** isojson works there, but it is
 not free-threading-ready yet. The module declares that it needs the GIL, so
 CPython re-enables the GIL when it is imported and prints a `RuntimeWarning`.
 We checked this on 3.14t. The `str` fast path is also off on those builds.
@@ -121,23 +122,25 @@ requirements.
 - **Multi-phase init with per-interpreter state.** The module declares
   `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, which is honest only because
   nothing process-global holds a Python object (see above). The only
-  process-global pointers isojson touches are CPython's static builtin types
-  and the immortal singletons `None`/`True`/`False`, which every interpreter
-  shares by design.
+  process-global pointers isojson touches are CPython's static builtin types,
+  `_datetime`'s static types and C-API struct, and the immortal singletons
+  `None`/`True`/`False`, which every interpreter shares by design.
 - **The key cache is per interpreter.** Like orjson, `loads` caches recently
   seen dict keys, so repeated keys reuse one `str` with its hash already
   computed. orjson keeps that cache process-wide. isojson keeps one per
   interpreter, because a shared cache would hand one interpreter's objects to
   another.
-- **`dumps` borrows and doesn't keep.** It only borrows objects for the
-  length of the call, on the calling thread, under the caller's GIL. When a
-  `default=` callback could run arbitrary Python code and mutate a container,
-  items are also held by a reference for that span. Output is written
+- **`dumps` borrows; only types are kept.** It only borrows the objects it
+  writes, for the length of the call, on the calling thread, under the
+  caller's GIL; across calls it keeps only the per-interpreter type cache.
+  When Python code could run during the walk (a `default=` callback, or a
+  `datetime`'s `utcoffset()`) and mutate a container, items are also held by
+  a reference for that span. Output is written
   straight into the result `bytes` object, so there is no final copy. String
   escaping scans 16 bytes at a time: SSE2 on x86_64 and NEON on aarch64, both
   part of those architectures' baseline, so no runtime detection is needed.
 - **`str` contents are read from the object header, after a self-check.**
-  Where CPython 3.12–3.14 already holds a string's UTF-8 (compact ASCII, or a
+  Where CPython 3.14 already holds a string's UTF-8 (compact ASCII, or a
   cached UTF-8 copy), isojson reads it directly instead of calling
   `PyUnicode_AsUTF8AndSize`. That layout is not public API. So at import,
   isojson compares its reading with the API on probe strings and turns the
@@ -210,45 +213,99 @@ isojson's own tests cover the case.
 | `OPT_STRICT_INTEGER`, `OPT_PASSTHROUGH_SUBCLASS` | ✅ | ✅ | — |
 | `loads` from `bytes` / `bytearray` / `memoryview` / `str` | ✅ | ✅ | `str`/`bytes` only |
 | Output bytes identical to orjson for the types above | ✅ | — | ❌ |
-| `datetime` / `date` / `time` serialized natively | ❌ → `default=` | ✅ | ❌ |
+| `datetime` / `date` / `time` natively, with `OPT_NAIVE_UTC`, `OPT_UTC_Z`, `OPT_OMIT_MICROSECONDS`, `OPT_PASSTHROUGH_DATETIME` | ✅ | ✅ | ❌ |
+| numpy arrays and scalars (`OPT_SERIALIZE_NUMPY`), incl. `datetime64` | ✅ (numpy ≥ 2) | ✅ | ❌ |
 | `uuid.UUID`, `enum.Enum`, dataclasses natively | ❌ → `default=` | ✅ | ❌ |
-| numpy arrays (`OPT_SERIALIZE_NUMPY`) | ❌ raises | ✅ | ❌ |
 | Non-`str` dict keys (`OPT_NON_STR_KEYS`) | ❌ raises | ✅ | ~ (coerced) |
 | `orjson.Fragment` | ❌ | ✅ | ❌ |
 | Integers beyond 64 bits in `dumps` | ❌ (like orjson) | ❌ | ✅ |
 | NaN / ±Infinity in `dumps` | `null` (like orjson) | `null` | `NaN` / `Infinity` |
-| Python versions | CPython 3.12–3.14 | CPython 3.10+ | all |
+| Python versions | CPython 3.14 | CPython 3.10+ | all |
 
 ## Differences from orjson
 
 These are all the known differences. Anything not listed produces the same
-result as orjson 3.12 (the test suite checks this, see [Testing](#testing)).
+result as orjson 3.12.0 (the test suite checks this, see [Testing](#testing)).
 
-- **Native `datetime`, `UUID`, `Enum`, dataclass, and numpy support is not
-  implemented yet.** Such objects go to your `default=` callable, the same as
-  any other unsupported type. Without a `default`, `dumps` raises
-  `TypeError: Type is not JSON serializable: <type>`, with the same message as
-  orjson.
-- **`OPT_NON_STR_KEYS` and `OPT_SERIALIZE_NUMPY` raise** `TypeError: isojson
-  does not support ...`. They are not silently ignored, because ignoring them
-  would produce output you did not ask for.
-- **Options that only affect datetimes and dataclasses are accepted and do
-  nothing:** `OPT_NAIVE_UTC`, `OPT_OMIT_MICROSECONDS`, `OPT_UTC_Z`,
-  `OPT_PASSTHROUGH_DATETIME`, `OPT_PASSTHROUGH_DATACLASS`. isojson never
-  serializes those types natively, so these options can have no effect.
-  `OPT_SERIALIZE_DATACLASS` and `OPT_SERIALIZE_UUID` are `0`, as in orjson.
+### Where orjson crashes or writes wrong data
+
+isojson writes what Python's own API says the value is: `isoformat()` for
+`datetime` / `date` / `time` (after the options are applied), and for
+`datetime64` the meaning numpy's API defines (`v × mult` units since 1970,
+sub-µs floored to µs). What has no answer in that format is *declined* (next
+section). Each row has a regression test that proves both halves.
+
+| # | Input | orjson 3.12.0 | isojson |
+|---|---|---|---|
+| DV-1 | UTC offset with seconds or microseconds (`+05:59:30`, `-00:00:01`, New York before 1883 = `-04:56:02`) | rounds to the minute without carrying: `+05:60`, `-00:00` (sign lost), `-04:56` | `isoformat()`'s offset, exactly |
+| DV-3 | pytz datetime after arithmetic, not normalized | the normalized offset on the un-normalized wall time (a different instant) | `dt.utcoffset()` |
+| DV-4a | a tzinfo whose `utcoffset()` returns `None` | an invented offset (`+00:00` on macOS / x86_64 Linux, garbage such as `+18:12` on aarch64 Linux) | no offset: naive to Python |
+| DV-4b | `utcoffset()` raises (datetime) / is invalid (time) | datetime: crashes (SIGSEGV) | `TypeError("datetime.utcoffset() raised …")`, the exception as `__cause__` |
+| DV-5 | `datetime64` NaT in `ns` | `"1677-09-21T00:12:43.145224"` | `null` |
+| DV-6 | NaT in `W D h m` | `"1970-01-01T00:00:00"` | `null` |
+| DV-7 | NaT in `Y M s ms us`, and generic NaT | `TypeError` | `null` |
+| DV-8 | multiplied units (`M8[10ms]`, `M8[2D]`) | crashes (`unreachable!()`) | value × multiplier |
+| DV-9 | `M8[M]` before 1970 | crashes / `TypeError` | floor division (`1969-12-01T00:00:00`) |
+| DV-10 | `M8[D…us]` from `9999-12-30T22:00` to `9999-12-31` | `TypeError` | written |
+| DV-11 | values whose seconds overflow i64 (`M8[m]` 307445734561825861) | a wrapped, wrong value | declined |
+| DV-12 | `datetime.time` with `tzinfo` | `TypeError` | `t.isoformat()`: `"01:00:00+00:00"` |
+| DV-13 | generic-unit `M8` holding a value | `TypeError: … unit: NaT` (misnames it) | declined |
+| DV-14 | ≥2-D `M8` arrays with an element orjson's 1-D writer rejects | **malformed JSON, no error, even with `default`** (`[[,[…]]`) | per the rows above |
+| DV-15 | `utcoffset()` returns a non-timedelta or ≥ 24 h | an invented or garbage offset | `TypeError`, as `dt.utcoffset()` raises |
+| DV-16 | `datetime64` in `ps`, `fs`, `as` | `TypeError`, even with `default` | floored to µs |
+| DV-17 | a `time` whose microsecond has five digits (`time(0, 0, 1, 75652)`) | drops the leading zero: `"00:00:01.75652"` | `"00:00:01.075652"` |
+
+### Declined numpy objects
+
+A numpy object isojson can't write — a non-C-contiguous or non-native-endian
+array, a 0-d array, an unsupported dtype, a generic-unit value, an
+unrepresentable `datetime64` — goes **whole** to `default=` when one is given.
+A decline found mid-array rolls the output back first, so `default` gets the
+array, not a half-written one. Without `default`, `dumps` raises orjson's
+message for the reason, with a note (`add_note`) carrying the raw evidence
+(`dtype.str`, flags, shape, value). orjson sends some of these to `default`
+too, but raises for non-native-endian arrays and out-of-range `datetime64`
+even with a `default`. Unrecognized numpy scalars (`complex128`,
+`longdouble`) take the ordinary `default` path. Unaligned C-contiguous arrays
+(`np.frombuffer(…, offset=1)`) are read correctly (orjson's typed-slice read
+is undefined behaviour there).
+
+### Kept from 0.1
+
+- **`uuid.UUID`, `enum.Enum`, dataclasses and `orjson.Fragment`** go to
+  `default=` (or raise `Type is not JSON serializable`).
+- **`OPT_NON_STR_KEYS` raises** `TypeError: isojson does not support
+  OPT_NON_STR_KEYS`, rather than being silently ignored.
+  `OPT_PASSTHROUGH_DATACLASS` is accepted and does nothing (isojson never
+  serializes dataclasses); `OPT_SERIALIZE_DATACLASS` and `OPT_SERIALIZE_UUID`
+  are `0`, as in orjson.
+- **`default=None`** means "no default". orjson calls `None` and raises
+  `Type is not JSON serializable` with a `'NoneType' object is not callable`
+  cause.
+- **Argument errors** (`dumps()` with no object, unknown keywords) have
+  different wording.
 - **`loads` error messages differ.** The exception type (`JSONDecodeError`,
   a subclass of `json.JSONDecodeError` and `ValueError`) and `.pos` / `.lineno`
   / `.colno` match. The wording of `.msg` does not always match orjson's.
-- **CPython 3.12–3.14 only.** Per-interpreter GIL arrived in 3.12. On
-  free-threaded builds (3.13t/3.14t) the module declares that it needs the
+
+## Limitations
+
+- **CPython 3.14 only.** Per-interpreter GIL arrived in 3.12, but 3.12's
+  and 3.13's own `_datetime` isn't usable from concurrent strict
+  sub-interpreters, so isojson targets 3.14.
+- **Free-threaded builds (3.14t):** the module declares that it needs the
   GIL, so CPython re-enables it on import (see above).
+- **numpy:** `OPT_SERIALIZE_NUMPY` is tested with numpy ≥ 2. isojson reads
+  arrays through `__array_struct__` and never imports numpy; it uses the
+  numpy the calling interpreter already has in `sys.modules`.
 
 ## Performance
 
 Reproduce with `python bench/bench.py`. Each cell is the median of repeated
 runs. Parallel cells time only the work loop: interpreter or process
-creation and imports happen before timing starts.
+creation and imports happen before timing starts. The single-interpreter
+and datetime/numpy tables are isojson 0.2.0; the parallel tables were
+measured with 0.1.0 (0.2's per-call `dumps` is within 2–7% of 0.1's).
 
 ### macOS arm64: Apple M5 Pro, 18 cores, CPython 3.14.7, orjson 3.12.0
 
@@ -288,23 +345,40 @@ How to read this:
 
 | `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 47 ns | 46 ns | 594 ns | 1.03× |
-| records ×100 | 18.33 µs | 17.04 µs | 153.80 µs | 1.08× |
-| records ×2000 | 349.52 µs | 298.00 µs | 2.86 ms | 1.17× |
-| floats ×10k | 111.83 µs | 209.36 µs | 2.39 ms | **0.53×** |
-| unicode/escapes ×200 | 12.88 µs | 11.05 µs | 124.12 µs | 1.17× |
+| small (27 B) | 49 ns | 43 ns | 567 ns | 1.14× |
+| records ×100 | 18.04 µs | 15.83 µs | 145.72 µs | 1.14× |
+| records ×2000 | 342.46 µs | 279.09 µs | 2.73 ms | 1.23× |
+| floats ×10k | 95.87 µs | 188.74 µs | 2.21 ms | **0.51×** |
+| unicode/escapes ×200 | 12.43 µs | 9.97 µs | 107.87 µs | 1.25× |
 
 | `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 107 ns | 101 ns | 1.09 µs | 1.06× |
-| records ×100 | 62.46 µs | 45.94 µs | 111.03 µs | 1.36× |
-| records ×2000 | 1.39 ms | 851.92 µs | 2.16 ms | 1.63× |
-| floats ×10k | 224.24 µs | 199.21 µs | 1.14 ms | 1.13× |
-| unicode/escapes ×200 | 94.63 µs | 68.32 µs | 171.29 µs | 1.39× |
+| small (27 B) | 101 ns | 70 ns | 553 ns | 1.44× |
+| records ×100 | 49.48 µs | 38.35 µs | 101.08 µs | 1.29× |
+| records ×2000 | 1.03 ms | 777.99 µs | 2.02 ms | 1.32× |
+| floats ×10k | 195.54 µs | 162.60 µs | 1.06 ms | 1.20× |
+| unicode/escapes ×200 | 63.99 µs | 42.94 µs | 118.75 µs | 1.49× |
 
-In summary: `dumps` is within 1.2× of orjson and about 2× faster on
-float-heavy documents. `loads` is 1.1–1.6× slower than orjson. Both are
-1.5–21× faster than stdlib `json`.
+**datetime and numpy** (`dumps`; `python bench/bench.py types`):
+
+| payload | isojson | orjson | isojson / orjson |
+|---|---:|---:|---:|
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 182.90 µs | 236.75 µs | **0.77×** |
+| numpy `float64` × 1M | 14.89 ms | 22.45 ms | **0.66×** |
+| numpy `float64` 1000 × 1000 | 14.93 ms | 21.76 ms | **0.69×** |
+| numpy `int64` × 1M | 7.30 ms | 6.77 ms | 1.08× |
+| 10k numpy `float64` scalars | 204.75 µs | 288.92 µs | **0.71×** |
+| 10k numpy `int64` scalars | 115.96 µs | 155.99 µs | **0.74×** |
+
+Aware datetimes are faster than orjson's because the offset comes from one
+`tzinfo.utcoffset(dt)` call, checked the way CPython checks it, while orjson
+probes the tzinfo's attributes first. `float64` arrays and scalars share the
+float writer that makes float-heavy documents fast.
+
+In summary, on this machine: `dumps` is 1.1–1.25× orjson's time on plain
+JSON, about 2× faster on float-heavy documents, and faster on datetimes and
+numpy. `loads` is 1.2–1.5× slower than orjson. Both are 1.5–23× faster than
+stdlib `json`.
 
 The remaining `loads` gap is mostly fixed per-call cost around simd-json:
 the input is copied (simd-json unescapes in place, and `bytes` are
@@ -333,23 +407,38 @@ the fastest row (98k).
 
 | `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 78 ns | 79 ns | 933 ns | 0.99× |
-| records ×100 | 27.25 µs | 19.83 µs | 171.77 µs | 1.37× |
-| records ×2000 | 736.39 µs | 382.51 µs | 3.99 ms | 1.93× |
-| floats ×10k | 180.59 µs | 183.01 µs | 3.23 ms | 0.99× |
-| unicode/escapes ×200 | 16.93 µs | 13.93 µs | 107.23 µs | 1.22× |
+| small (27 B) | 79 ns | 70 ns | 793 ns | 1.14× |
+| records ×100 | 24.73 µs | 17.19 µs | 148.74 µs | 1.44× |
+| records ×2000 | 660.35 µs | 336.80 µs | 3.37 ms | 1.96× |
+| floats ×10k | 164.61 µs | 163.90 µs | 2.81 ms | 1.00× |
+| unicode/escapes ×200 | 14.44 µs | 11.82 µs | 92.46 µs | 1.22× |
 
 | `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 146 ns | 128 ns | 948 ns | 1.13× |
-| records ×100 | 78.60 µs | 54.66 µs | 151.23 µs | 1.44× |
-| records ×2000 | 1.67 ms | 1.17 ms | 3.10 ms | 1.42× |
-| floats ×10k | 300.53 µs | 188.56 µs | 1.58 ms | 1.59× |
-| unicode/escapes ×200 | 87.24 µs | 54.87 µs | 164.43 µs | 1.59× |
+| small (27 B) | 130 ns | 114 ns | 848 ns | 1.14× |
+| records ×100 | 69.21 µs | 47.23 µs | 130.90 µs | 1.47× |
+| records ×2000 | 1.42 ms | 989.92 µs | 2.72 ms | 1.43× |
+| floats ×10k | 262.10 µs | 166.52 µs | 1.40 ms | 1.57× |
+| unicode/escapes ×200 | 78.41 µs | 49.52 µs | 147.87 µs | 1.58× |
+
+**datetime and numpy** (`dumps`):
+
+| payload | isojson | orjson | isojson / orjson |
+|---|---:|---:|---:|
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 286.39 µs | 277.75 µs | 1.03× |
+| numpy `float64` × 1M | 18.04 ms | 17.84 ms | 1.01× |
+| numpy `float64` 1000 × 1000 | 17.95 ms | 17.66 ms | 1.02× |
+| numpy `int64` × 1M | 9.53 ms | 9.30 ms | 1.02× |
+| 10k numpy `float64` scalars | 281.20 µs | 274.20 µs | 1.03× |
+| 10k numpy `int64` scalars | 176.61 µs | 218.76 µs | **0.81×** |
 
 Per call, x86_64 is harder on isojson than arm64. `dumps` of large record
-documents is 1.9× slower than orjson here, against 1.2× on the Mac, and `loads`
-is 1.1–1.6× slower. Both are still 1.9–18× faster than stdlib `json`.
+documents is 2.0× slower than orjson here, against 1.2× on the Mac, and
+`loads` is 1.1–1.6× slower; datetimes and numpy are at parity. Both are still
+1.9–19× faster than stdlib `json`. Floats are at parity since 0.2, which
+writes them in place in the output: 0.1 formatted each into a stack buffer and
+copied it out, which x86_64 can't store-forward (floats in [0, 1) or integral
+floats took up to twice orjson's time).
 
 ### Across both machines
 
@@ -361,9 +450,11 @@ both.
 ## Testing
 
 ```bash
-pip install maturin pytest orjson
+pip install maturin
+pip install -e ".[test]"      # pytest, orjson==3.12.0, numpy>=2, pytz, tzdata
 maturin develop --release
 pytest tests
+cargo test --lib              # the pure Rust core
 ```
 
 - **Parity with orjson** (`tests/test_parity.py`):
@@ -391,19 +482,43 @@ pytest tests
 - **Threads** (`tests/test_threads.py`): 8 threads in one interpreter, and
   4 threads plus 4 sub-interpreters at the same time, each worker on its own
   seeded data with its own expected answer.
+- **datetime and numpy** (0.2):
+  - byte parity with orjson for every datetime option combination, numpy
+    dtypes × shapes × `default` × `OPT_INDENT_2`, and random documents
+    (`tests/test_parity_types.py`);
+  - one regression per [difference](#differences-from-orjson), proving
+    orjson's failure, the Python-API reference, and isojson's match; the
+    crash rows run in child processes (`tests/test_divergence.py`);
+  - the Python API as the oracle: `isoformat()` / `fromisoformat()` round
+    trips, and `datetime64` in every unit × multiplier across the i64 range
+    against the exact integer meaning (`tests/test_stdlib_oracle.py`);
+  - every decline rule, rollback, notes, and unaligned arrays
+    (`tests/test_declines.py`); all 65,536 float16 values bit-exactly
+    (`tests/test_f16.py`); a replaced `sys.modules["numpy"]`
+    (`tests/test_numpy_swap.py`);
+  - reentrancy: `utcoffset()` mutating the container being written, under
+    `PYTHONMALLOC=debug` (`tests/test_reentrancy.py`); concurrent
+    sub-interpreters writing datetimes (`tests/test_concurrency_dt.py`);
+  - no process-global Python state: every `static` reviewed, banned symbols,
+    cached types traversed by the GC (`tests/test_no_global_pyobject.py`).
+- **Per-worker numpy in Pyronova**: Pyronova's
+  `tests/test_isojson_numpy_workers.py` runs 4 workers, each with its own
+  numpy copy, against orjson's bytes.
 
 The suite passes on macOS arm64 and Linux x86_64, both normally and under
 `PYTHONMALLOC=debug`. The `-X dev` / `PYTHONDEVMODE=1` run is on Linux.
 
 ## Status
 
-Version 0.1.0. The API is stable (it is orjson's). Native `datetime`, `UUID`,
-`Enum`, and dataclass support is next.
+Version 0.2.0: native `datetime` / `date` / `time` and numpy. The API is
+stable (it is orjson's). `UUID`, `Enum` and dataclass support is next.
 
 ## License
 
 Apache-2.0.
 
-Third-party: simd-json (Apache-2.0 OR MIT); `tests/data/JSONTestSuite` is from
+Third-party: simd-json (Apache-2.0 OR MIT); the float16 → float32
+conversion is half-rs's `f16_to_f32_fallback` as shipped in orjson
+(Apache-2.0 OR MIT, attribution in `src/float.rs`); `tests/data/JSONTestSuite` is from
 [nst/JSONTestSuite](https://github.com/nst/JSONTestSuite) (MIT, license
 included in that directory).
