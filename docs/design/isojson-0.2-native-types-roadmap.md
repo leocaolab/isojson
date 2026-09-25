@@ -67,7 +67,7 @@ M0 pure core ──► M1 cache + guard + datetime ──► M2 numpy ──► 
   - E2E-2 (datetime part, including the `class D(datetime)` → `default` case).
   - E2E-4: the datetime DV rows.
   - E2E-5 (no imports), E2E-6 (concurrency with the immortality tripwire), E2E-7 (3.12
-    pure-Python datetime), E2E-8 (datetime part), E2E-9 (1)–(4), E2E-10 / 10b
+    pure-Python datetime; removed in M2 with 3.12/3.13 support), E2E-8 (datetime part), E2E-9 (1)–(4), E2E-10 / 10b
     (reentrancy in fresh processes).
   - The debug-build pytest job.
 - **Independently shippable:** yes. `datetime` / `date` / `time` serialize natively with

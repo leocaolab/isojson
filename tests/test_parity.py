@@ -349,7 +349,7 @@ def test_output_growth():
 
 
 def test_str_fast_path_is_active():
-    """On CPython 3.12-3.14 GIL builds the import-time self-check must pass;
+    """On CPython 3.14 GIL builds the import-time self-check must pass;
     if it silently failed, isojson would still be correct but slower."""
     import sysconfig
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):

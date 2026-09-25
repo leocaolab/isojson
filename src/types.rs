@@ -15,8 +15,8 @@ use pyo3_ffi::*;
 
 use crate::{PyErrSet, R};
 
-/// The datetime group: `_datetime`'s C types, which are static and shared by
-/// every interpreter on 3.13+ and immortal, so reference counting them from
+/// The datetime group: `_datetime`'s C types, which are static, shared by
+/// every interpreter and immortal, so reference counting them from
 /// several own-GIL interpreters is race-free (E2E-6 has the tripwire).
 #[derive(Clone, Copy)]
 pub(crate) struct DtTypes {
@@ -153,7 +153,7 @@ pub(crate) struct TypeCache {
 /// `d[key]` as a strong reference; `Ok(None)` if missing.
 unsafe fn get_item(d: *mut PyObject, key: *mut PyObject) -> R<Option<*mut PyObject>> {
     let mut v = ptr::null_mut();
-    match pyo3_ffi::compat::PyDict_GetItemRef(d, key, &mut v) {
+    match PyDict_GetItemRef(d, key, &mut v) {
         1 => Ok(Some(v)),
         0 => Ok(None),
         _ => Err(PyErrSet),

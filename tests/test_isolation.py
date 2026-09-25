@@ -1,15 +1,9 @@
-"""E2E-5 (isojson imports nothing) and E2E-7 (3.12's pure-Python datetime),
-each in a fresh strict own-GIL sub-interpreter (`tests/interp/strict.py`)."""
+"""E2E-5: isojson imports nothing, in a fresh strict own-GIL
+sub-interpreter (`tests/interp/strict.py`)."""
 
-import datetime  # noqa: F401  (E2E-7 needs main to have imported it)
-import sys
 import textwrap
 
-import pytest
-
 from interp import strict
-
-pytestmark = pytest.mark.skipif(not strict.AVAILABLE, reason="no sub-interpreter module")
 
 
 def run_fresh(code):
@@ -55,7 +49,6 @@ def test_non_json_goes_to_default_with_datetime_and_no_numpy():
     )
 
 
-@pytest.mark.skipif(sys.version_info < (3, 13), reason="3.12 falls back to _pydatetime here (E2E-7)")
 def test_datetime_stays_native_without_the_datetime_module():
     """FR-2: the lookup is `sys.modules["_datetime"]`, not `datetime`."""
     run_fresh(
@@ -65,29 +58,5 @@ def test_datetime_stays_native_without_the_datetime_module():
         x = datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc)
         del sys.modules["datetime"]
         assert isojson.dumps(x) == b'"2026-01-01T12:00:00+00:00"'
-        """
-    )
-
-
-@pytest.mark.skipif(sys.version_info[:2] != (3, 12), reason="3.12 only")
-def test_312_pure_python_datetime_goes_to_default():
-    """E2E-7: with main having imported `datetime`, a strict 3.12
-    sub-interpreter can't load `_datetime` and falls back to `_pydatetime`,
-    whose objects have no C layout, so they go to `default`."""
-    assert "_datetime" in sys.modules
-    run_fresh(
-        """
-        import sys, datetime, isojson
-        assert "_pydatetime" in sys.modules and "_datetime" not in sys.modules
-        x = datetime.datetime(2026, 1, 1)
-        seen = []
-        assert isojson.dumps(x, default=lambda o: seen.append(o) or "D") == b'"D"'
-        assert seen == [x]
-        try:
-            isojson.dumps(x)
-        except TypeError as e:
-            assert str(e).startswith("Type is not JSON serializable"), e
-        else:
-            raise AssertionError("no error")
         """
     )

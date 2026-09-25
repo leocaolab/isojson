@@ -12,6 +12,8 @@
 //! Multi-phase init (PEP 489) + `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` means
 //! the module loads in strict own-GIL sub-interpreters with no override.
 
+#[cfg(not(Py_3_14))]
+compile_error!("isojson requires CPython 3.14");
 #[cfg(Py_3_15)]
 compile_error!("isojson does not support Python 3.15 yet (PyModExport init is not wired)");
 
@@ -216,9 +218,7 @@ static mut METHODS: [PyMethodDef; 3] = [
     PyMethodDef::zeroed(),
 ];
 
-const SLOTS_LEN: usize = 3 + cfg!(Py_3_13) as usize;
-
-static mut SLOTS: [PyModuleDef_Slot; SLOTS_LEN] = [
+static mut SLOTS: [PyModuleDef_Slot; 4] = [
     PyModuleDef_Slot {
         slot: Py_mod_exec,
         value: module_exec as *mut c_void,
@@ -230,7 +230,6 @@ static mut SLOTS: [PyModuleDef_Slot; SLOTS_LEN] = [
     // Free-threaded builds: we iterate dicts/lists with borrowed refs, which
     // is only safe under a GIL. Declare that honestly instead of claiming
     // GIL_NOT_USED.
-    #[cfg(Py_3_13)]
     PyModuleDef_Slot {
         slot: Py_mod_gil,
         value: Py_MOD_GIL_USED,

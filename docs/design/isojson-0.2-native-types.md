@@ -31,11 +31,10 @@ into per-interpreter module state (C1).
 - **Datetime subclasses** (`pandas.Timestamp`): `default`, as orjson (exact-type
   dispatch).
 - **Pure-Python datetimes** (`_pydatetime`): `default`. They have no C layout.
-  - On **3.12**, every datetime in a strict sub-interpreter is one of these once the main
-    interpreter has imported `datetime`: `_datetime` then fails the multi-interpreter
-    check (measured).
-  - On 3.13+ `_datetime` loads in strict sub-interpreters (measured on 3.13.15 and 3.14.7).
-  - On **3.13** it is not safe *concurrently*: CPython 3.13.15's `_datetime` alone crashes when strict interpreters import or use it at the same time (measured in M1, isojson not involved; E2E-6). 3.14.7 is fine. isojson can't fix this; it's CPython's.
+  - On 3.14 `_datetime` loads in strict sub-interpreters (measured on 3.14.7). (On 3.12 a
+    strict sub-interpreter falls back to `_pydatetime` once main has imported `datetime`.)
+  - (On 3.13 it is not safe *concurrently*: CPython 3.13.15's `_datetime` alone crashes when strict interpreters import or use it at the same time (measured in M1, isojson not involved; E2E-6). 3.14.7 is fine. isojson can't fix this; it's CPython's.)
+- **CPython 3.12 and 3.13** (maintainer, 2026-09-24, during M2: "只支持 3.14"). 0.2 requires CPython 3.14: `requires-python >=3.14`, a `compile_error!` below 3.14, CI and wheels for 3.14 only. E2E-7 and `tests/test_subinterp_312_313.py` are removed; FR-14 records the change.
 - **numpy objects isojson can't write:** FR-7, the single list.
 - **Making numpy itself shareable across interpreters.** numpy fails strict import
   (measured), so each Pyronova worker has its own copy, and isojson uses the current
@@ -152,7 +151,7 @@ both halves (E2E-4). README "Differences from orjson" mirrors this table; E2E-9 
   Steps: call `isojson.dumps` with the options it used with orjson. Success: bytes equal
   orjson's, except §1b inputs (E2E-2, E2E-8).
 - **CUJ-2 — numpy in many workers, each with its own numpy.** Actor: a Pyronova app in
-  sub-interpreter mode on 3.13+. numpy is cloned per worker, declared
+  sub-interpreter mode on 3.14. numpy is cloned per worker, declared
   (`app.isolate("numpy")`) or reactively. Handlers call
   `isojson.dumps(x, option=OPT_SERIALIZE_NUMPY)` concurrently. Success:
   - every worker serializes its own numpy's objects natively;
@@ -161,7 +160,7 @@ both halves (E2E-4). README "Differences from orjson" mirrors this table; E2E-9 
 - **CUJ-3 — an input that breaks orjson.** Trigger: a §1b input. Success: the Python
   API's answer, or a decline (FR-7). Never a crash, never an invented value.
 - **CUJ-4 — isojson loads everywhere and imports nothing.** Success:
-  - strict import in own-GIL sub-interpreters on 3.12, 3.13 and 3.14 with no override;
+  - strict import in own-GIL sub-interpreters on 3.14 with no override;
   - neither `import isojson` nor `dumps` imports `numpy`, `datetime` or `_datetime`.
 
 ## 3. Feature list
@@ -194,7 +193,7 @@ both halves (E2E-4). README "Differences from orjson" mirrors this table; E2E-9 
 | FR-11 | `OPT_SERIALIZE_NUMPY` is accepted (removed from `UNSUPPORTED_OPTS`). Without it, numpy objects go to `default` as in 0.1. `OPT_NON_STR_KEYS` still raises. Existing-test change T-1 (impl doc, approved) | F3 |
 | FR-12 | Messages new in 0.2 are defined in FR-7 and the DV rows. All other errors raised on the new paths are identical to orjson's (`orjson/src/serialize/error.rs:61-114`). 0.1's existing messages and `default=None` handling are unchanged (§1b "not bugs") | all |
 | FR-13 | **Reentrancy.**<br>• At the start of `dumps`, the encoder resolves the datetime group, `dt = cache.datetime()`, and sets `guard = default given \\|\\| OPT_SERIALIZE_NUMPY \\|\\| dt loaded`.<br>• While `guard` is set, every item and key taken from a list or dict holds a reference while it is serialized (`guarded`, and `dict_in_order`'s no-default branch; §14).<br>• **Invariant:** with `guard` false, no Python code can run during the walk: no `default`, no numpy, no datetime type to call `utcoffset()` on. 0.1 has no Python-running path (verified by the round-3 auditor with instrumented subclasses).<br>• While guarded and the datetime snapshot is Absent, `cache.datetime()` is retried once per object that misses the fast path (E2E-10b).<br>• Each Python-running call site carries `debug_assert!(self.guard)` (C2) | F2, F3 |
-| FR-14 | Public-behaviour change is recorded: for 0.1 callers, `datetime`/`date`/`time` no longer reach `default`, and the datetime options take effect. Pyronova's response paths (§7) serialize datetimes instead of raising `TypeError`. A caller that relied on its own `default` for datetimes and passes no options will see naive datetimes written without an offset. The CHANGELOG states this and names `OPT_NAIVE_UTC`. Version 0.2.0 and a CHANGELOG entry (C7) | F6 |
+| FR-14 | Public-behaviour change is recorded: for 0.1 callers, `datetime`/`date`/`time` no longer reach `default`, and the datetime options take effect. Pyronova's response paths (§7) serialize datetimes instead of raising `TypeError`. A caller that relied on its own `default` for datetimes and passes no options will see naive datetimes written without an offset. The CHANGELOG states this and names `OPT_NAIVE_UTC`, and that 0.2 requires CPython 3.14 (3.12/3.13 dropped). Version 0.2.0 and a CHANGELOG entry (C7) | F6 |
 
 **Non-functional** (`bench/bench.py`, median of 7, release build, macOS arm64 and Linux
 x86_64; a manual release gate)
@@ -384,7 +383,7 @@ x86_64; a manual release gate)
 ### C6 — Tests and CI
 The test list is §9. New helper modules:
 - `tests/oracle/python_api.py` (`expected_text`, §1a);
-- `tests/interp/strict.py`, a strict-interpreter `make()`/`run()` shim for 3.12–3.14,
+- `tests/interp/strict.py`, a strict-interpreter `make()`/`run()` shim (3.14's `concurrent.interpreters`),
   modelled on the existing shim (§14). The existing shim file is not edited;
   T-4 in the impl doc covers a later merge.
 
@@ -507,9 +506,9 @@ no E2E-1.)
 | E2E-2 parity | CUJ-1 | datetime/date/time × {naive, UTC, +8, −5, zoneinfo, pytz} × all four datetime options, plus a datetime subclass (`class D(datetime)`) → `default`; numpy dtypes × shapes (1-D, 2-D, 0-length dims, non-contiguous, 0-d) with and without `default`; scalars; a new random-document generator (`rand_value` untouched). numpy also under `OPT_INDENT_2`. "Without default" means the argument is omitted (not `default=None`, §1b). Bytes and exception type/message equal orjson, **excluding** inputs matched by any DV row's predicate (by id) or by the §1b "not bugs" list |
 | E2E-3 per-worker numpy (pyre) | CUJ-2 | `pyre/tests/test_isojson_numpy_workers.py` (harness §5), run declared and reactive. 4 workers; `/s/{seed}` returns `isojson.dumps(seeded payload, default=raise_, option=NUMPY).decode()`, the interpreter id and `np.__file__`. The payload holds only layouts isojson writes: C-contiguous native arrays (f64, f32, f16, i64, u8, bool, `M8[ns]`, 2-D) and scalars, with no NaT and no declined layouts. 256 requests × 16 threads; each equals the test process's `orjson.dumps` for that seed; ≥2 interpreters; every `np.__file__` under the copies dir; 4 clone dirs; SIGINT → rc 0; no "Fatal Python error". Fails, not skips, on a missing dependency |
 | E2E-4 regression, one per DV row (`tests/test_divergence.py`) | CUJ-3 | DV-1, DV-3…16 (4a/4b both; DV-4a × every option combination without `NAIVE_UTC` (`UTC_Z`, `OMIT_MICROSECONDS`, both), where orjson writes `+00:00`/`Z` but isojson no offset — every combination with `NAIVE_UTC` agrees with orjson (measured in M1: `NAIVE_UTC\|UTC_Z` gives `Z` in both, correcting round 8) and lives in E2E-8 only; an invalid `time` offset: a tzinfo returning an int, and 25h; DV-14 with `M8[s]` NaT, out-of-range, `ps` and generic ≥2-D arrays; DV-15 with int, 24h, ±25h and `str` (for `str`, part (a) asserts no exception and output ≠ reference, since orjson's bytes vary per run); DV-16 with `ps`/`fs`/`as` 1-D; DV-17 at 10000, 75652 and 99999 µs). Three parts:<br>(a) orjson 3.12.0 fails: its wrong bytes or message; for DV-14, `json.loads` fails on orjson's bytes; for the death rows (DV-4b datetime, DV-8, DV-9 `1969-12`), a child with `returncode < 0` (POSIX; skipped on Windows with that reason);<br>(b) the reference = `expected_text`, or for declined rows the delegation to `default` and the FR-7 message;<br>(c) isojson == (b) |
-| E2E-5 no imports | CUJ-4 | Fresh strict interpreter via `tests/interp/strict.py` (3.12–3.14): `import isojson; isojson.dumps([1,"x"], option=NUMPY)`, then assert `numpy`, `datetime` and `_datetime` were not added to `sys.modules`. Then with `datetime` imported and numpy absent, a non-JSON `x` goes to `default`. **3.13+ only:** `del sys.modules["datetime"]` with `_datetime` loaded; a datetime is still native (FR-2) |
+| E2E-5 no imports | CUJ-4 | Fresh strict interpreter via `tests/interp/strict.py`: `import isojson; isojson.dumps([1,"x"], option=NUMPY)`, then assert `numpy`, `datetime` and `_datetime` were not added to `sys.modules`. Then with `datetime` imported and numpy absent, a non-JSON `x` goes to `default`. `del sys.modules["datetime"]` with `_datetime` loaded; a datetime is still native (FR-2) |
 | E2E-6 concurrency | CUJ-4 | 3.14 via the shim (3.13 dropped in M1: CPython 3.13.15's own `_datetime` crashes under concurrent strict interpreters with isojson neither imported nor called — concurrent import SIGSEGV 5/5, debug-allocator corruption 10/10, this workload with serialized setup SIGABRT 10/10; 3.14.7 passes all): 4 and 8 interpreters (patterns in §14), 8 threads, 200 create/destroy cycles, with seeded aware/naive datetime payloads, each checking its own bytes, under `PYTHONMALLOC=debug`. Datetime types are process-static on 3.13+ (measured), so type separation is E2E-3's job. Tripwire: `sys._is_immortal(datetime.datetime)` (3.14) / refcount == 2**32−1 (3.12–3.13) |
-| E2E-7 3.12 pure-Python datetime | CUJ-4 | 3.12 strict sub-interpreter after main imported `datetime`: `datetime` is `_pydatetime`; `dumps(dt, default=str)` calls `default`, and `dumps(dt)` raises `Type is not JSON serializable` |
+| E2E-7 (removed: CPython 3.14 only) | CUJ-4 | 3.12 strict sub-interpreter after main imported `datetime`: `datetime` is `_pydatetime`; `dumps(dt, default=str)` calls `default`, and `dumps(dt)` raises `Type is not JSON serializable` |
 | E2E-8 Python-API oracle | CUJ-1, CUJ-3 | Every datetime/date/time/datetime64 input from E2E-2/4, plus seeded random ones: for each unit × multipliers 1/2/3/7/10, values sampled over that unit's representable i64 range, including both i64 extremes and MIN+1 (ns/ps/fs/as cover only ~1677–2262 / ±106 d / ±2.5 h / ±9 s); Y/M at i64 max; offsets over ±23:59:59.999999, including µs; zoneinfo and pytz across DST and pre-standard-time dates; every combination of `NAIVE_UTC` × `UTC_Z` × `OMIT_MICROSECONDS` (`PASSTHROUGH_DATETIME` is E2E-2's). Assert `output == expected_text(x, opts)`, or the FR-7 (f) decline where `expected_text` raises `NoAnswer` byte for byte. Includes DV-4a tzinfos × every option, and a tzinfo returning a `timedelta` subclass. For years ≥ 0001 also assert `fromisoformat(output)` is the option-adjusted source with its `utcoffset()` (`fromisoformat` can't parse year 0000). Floats compared as in §1a |
 | E2E-9 no new process-global state | CUJ-4 | `tests/test_no_global_pyobject.py`:<br>(1) every `static` / `thread_local!` item in `src/*.rs` (comments skipped) is in one of two reviewed allow-lists. **Constants** (`HEX`, `ESCAPE`, `METHODS`, `SLOTS`, `MODULE_DEF`) are exempt from README. **Shared runtime state**: each entry records the README table row that covers it (`:61-65`), and the test asserts that row's text is present. Entries: strfast's switch → the str fast-path row; decode scratch and `out::HINT` → the per-thread row (HINT is a size, not a buffer; the README row is reworded to "per-thread scratch buffers and size hints"). The simd-json row refers to a dependency and is exempt.<br>(2) **the banned-symbol list (single home)**, as regexes over `src/` with comments skipped:
 • `\bPyDateTime_IMPORT\b`, `\bPyDateTimeAPI\b`, `\bPyDateTime_TimeZone_UTC\b`;
