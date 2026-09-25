@@ -720,7 +720,7 @@ Round numbers are in brackets.
 - **O-1 (Pyronova):** should Pyronova pass `OPT_SERIALIZE_NUMPY` or datetime options for
   handler return values? It has two per-interpreter isojson caches to set (§7's
   Pyronova row; the main-interpreter one has its own `_default`). To be decided after 0.2.
-- **O-2:** the numpy scalar read strategy, decided by benchmark (§11).
+- **O-2 (decided in M2):** the layout read. Measured on macOS arm64, 10k scalars: `__array_struct__` per scalar 4.8× (f64) / 6.8× (i64) orjson's time; the layout read (value right after the object header, as orjson) 0.76× / 0.78×, i.e. ≥2× faster (§11's criterion). E2E-3 on numpy 2.x is still M3's.
 - **O-3:** numpy's own capability boundary (`~/projects/pyo3/subinterp-bench/NUMPY.md`),
   owned by the PyO3 fork work, not by isojson.
 

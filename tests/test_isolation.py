@@ -30,6 +30,8 @@ def test_import_and_dumps_import_nothing():
         isojson.dumps([1, "x", {"k": (None, 2.5)}])
         isojson.dumps(object(), default=str)
         isojson.dumps([1], option=isojson.OPT_NAIVE_UTC | isojson.OPT_UTC_Z)
+        isojson.dumps([1, "x"], option=isojson.OPT_SERIALIZE_NUMPY)
+        isojson.dumps(object(), default=str, option=isojson.OPT_SERIALIZE_NUMPY)
         added = {m for m in watched if m in sys.modules} - before
         assert not added, added
         """

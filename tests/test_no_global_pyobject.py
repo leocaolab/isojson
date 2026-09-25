@@ -6,7 +6,7 @@
 (2) the banned-symbol list — the single home of those bans (design E2E-9);
 (4) FR-1's traverse: cached types are visited by the module's `m_traverse`.
 Comments are skipped. Part (3) (the README's DV list) lands with the README
-rewrite (M4); part (4)'s numpy check with numpy (M2).
+rewrite (M4).
 """
 
 import datetime
@@ -145,3 +145,10 @@ def test_cached_datetime_types_are_traversed():
     referents = gc.get_referents(isojson.isojson)
     for t in (datetime.datetime, datetime.date, datetime.time):
         assert t in referents
+
+
+def test_cached_numpy_types_are_traversed():
+    np = __import__("numpy")
+    isojson.dumps(np.float64(1.0), option=isojson.OPT_SERIALIZE_NUMPY)
+    referents = gc.get_referents(isojson.isojson)
+    assert np.float64 in referents and np.ndarray in referents and np in referents

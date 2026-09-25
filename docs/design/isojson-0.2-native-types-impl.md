@@ -744,3 +744,25 @@ decisions):
 - **README/crate doc:** the statements M1 made false were corrected now (shared-state
   row, per-interpreter state paragraph, process-global pointers, "borrows and doesn't
   keep"); the full C7 rewrite stays in M4.
+
+### M2 (isojson#3) — numpy
+
+- **Doubles and data:** as M1 (CPython + numpy are the adapter). New fixtures are
+  generated in the tests: the DV-14 ≥2-D arrays, unaligned `np.frombuffer(…, offset=1)`
+  arrays, all 65,536 float16 bit patterns, and per-unit datetime64 samples from the
+  exact-integer oracle (`expected_text`'s datetime64 rule, rendered by numpy's own
+  formatter). E2E-11's swaps run in fresh child processes.
+- **O-2 decided:** the scalar layout read (design §16 has the numbers).
+- **Performance work found by measuring (NFR-3/4 are M4's formal gate):** one reserve
+  per row, and a raw-pointer writer for compact integer rows (i64 1M `arange` 1.62× →
+  1.03× orjson; random i64 0.81×; f64 1M 0.74×).
+- **T-1 applied** (approved 2026-09-24): `tests/test_parity.py` `test_invalid_opts`
+  keeps only its `OPT_NON_STR_KEYS` half.
+- **Found while building:** FR-3's trusted hit means a replaced numpy changes nothing
+  until a miss; E2E-11 now forces the miss first and has a test for the trusted hit.
+  E2E-2's datetime64 values stay before 9999-12-30T22:00, where orjson's range ends
+  (DV-10).
+- **Moved here from M1 and done:** E2E-5 `option=NUMPY`, E2E-10's numpy variant,
+  E2E-9 (4) numpy.
+- **Python versions:** maintainer, 2026-09-24: verify on 3.14 only ("为什么还做3.13
+  不要了"). Whether the declared support shrinks is an open question for the maintainer.
