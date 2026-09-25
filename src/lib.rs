@@ -5,9 +5,9 @@
 //! in process-global storage.** Everything that must outlive a call lives in
 //! the module's per-interpreter state (`ModState`), which CPython allocates
 //! once per interpreter and tears down with it. The only process-global
-//! pointers we touch are CPython's static builtin types and the immortal
-//! singletons (`None`/`True`/`False`), which every interpreter shares by
-//! design and never refcounts.
+//! pointers we touch are CPython's static builtin types, `_datetime`'s static
+//! types and C-API struct, and the immortal singletons (`None`/`True`/
+//! `False`), which every interpreter shares by design.
 //!
 //! Multi-phase init (PEP 489) + `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` means
 //! the module loads in strict own-GIL sub-interpreters with no override.
@@ -23,6 +23,7 @@ mod float;
 mod out;
 mod strfast;
 mod swar;
+mod types;
 
 use core::ffi::{c_int, c_void};
 use core::ptr;
@@ -37,6 +38,8 @@ pub(crate) struct ModState {
     pub(crate) decode_error: *mut PyObject,
     /// Recently seen dict keys for `loads` — this interpreter's objects only.
     pub(crate) key_cache: *mut decode::KeyCache,
+    /// Types looked up in this interpreter's `sys.modules` (design C1).
+    pub(crate) types: types::TypeCache,
 }
 
 /// A Python exception is already set (e.g. MemoryError).
@@ -72,6 +75,9 @@ unsafe extern "C" fn module_exec(m: *mut PyObject) -> c_int {
     let st = state(m);
     (*st).decode_error = ptr::null_mut();
     (*st).key_cache = Box::into_raw(decode::KeyCache::new());
+    if (*st).types.init() < 0 {
+        return -1;
+    }
 
     // Subclass this interpreter's json.JSONDecodeError, so `except
     // json.JSONDecodeError` / `except ValueError` both catch ours.
@@ -147,13 +153,16 @@ unsafe extern "C" fn module_traverse(
     arg: *mut c_void,
 ) -> c_int {
     let st = state(m);
-    if !st.is_null() && !(*st).decode_error.is_null() {
+    if st.is_null() {
+        return 0;
+    }
+    if !(*st).decode_error.is_null() {
         let r = visit((*st).decode_error, arg);
         if r != 0 {
             return r;
         }
     }
-    0
+    (*st).types.traverse(visit, arg)
 }
 
 unsafe extern "C" fn module_clear(m: *mut PyObject) -> c_int {
@@ -169,6 +178,7 @@ unsafe extern "C" fn module_clear(m: *mut PyObject) -> c_int {
     if !(*st).key_cache.is_null() {
         (*(*st).key_cache).clear();
     }
+    (*st).types.clear();
     0
 }
 

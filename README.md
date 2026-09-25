@@ -60,14 +60,15 @@ plain data, never a Python object:
 
 | shared state | what it is |
 |---|---|
-| per-thread scratch buffers | bytes only (`thread_local!`) |
+| per-thread scratch buffers and size hints | bytes and sizes only (`thread_local!`) |
 | simd-json's CPU-feature detection | an atomic set once per process |
 | the `str` fast-path switch | an atomic, set by an import-time self-check that gives the same result in every interpreter |
 
 Every Python object isojson keeps longer than one call lives in
-per-interpreter module state. That is the `JSONDecodeError` type and the
-dict-key cache. CPython creates it for each interpreter and frees it with
-that interpreter.
+per-interpreter module state. That is the `JSONDecodeError` type, the
+dict-key cache, and the type cache (the `datetime` types, looked up in that
+interpreter's own `sys.modules`, never imported). CPython creates it for each
+interpreter and frees it with that interpreter.
 
 **How this is tested:** strict import in 6 own-GIL sub-interpreters, with no
 override; 4 and 8 sub-interpreters running concurrently; 8 threads in one
@@ -121,18 +122,20 @@ requirements.
 - **Multi-phase init with per-interpreter state.** The module declares
   `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`, which is honest only because
   nothing process-global holds a Python object (see above). The only
-  process-global pointers isojson touches are CPython's static builtin types
-  and the immortal singletons `None`/`True`/`False`, which every interpreter
-  shares by design.
+  process-global pointers isojson touches are CPython's static builtin types,
+  `_datetime`'s static types and C-API struct, and the immortal singletons
+  `None`/`True`/`False`, which every interpreter shares by design.
 - **The key cache is per interpreter.** Like orjson, `loads` caches recently
   seen dict keys, so repeated keys reuse one `str` with its hash already
   computed. orjson keeps that cache process-wide. isojson keeps one per
   interpreter, because a shared cache would hand one interpreter's objects to
   another.
-- **`dumps` borrows and doesn't keep.** It only borrows objects for the
-  length of the call, on the calling thread, under the caller's GIL. When a
-  `default=` callback could run arbitrary Python code and mutate a container,
-  items are also held by a reference for that span. Output is written
+- **`dumps` borrows; only types are kept.** It only borrows the objects it
+  writes, for the length of the call, on the calling thread, under the
+  caller's GIL; across calls it keeps only the per-interpreter type cache.
+  When Python code could run during the walk (a `default=` callback, or a
+  `datetime`'s `utcoffset()`) and mutate a container, items are also held by
+  a reference for that span. Output is written
   straight into the result `bytes` object, so there is no final copy. String
   escaping scans 16 bytes at a time: SSE2 on x86_64 and NEON on aarch64, both
   part of those architectures' baseline, so no runtime detection is needed.
