@@ -376,7 +376,7 @@ x86_64; a manual release gate)
   - `write_f32(out, f32)`: the finite check, like `write_f64`. Both call one generic
     `write_finite<F: zmij::Float>`. zmij's trait is sealed, so a generic `is_finite()` won't
     compile.
-  - `f16_to_f32(bits)`: the §5 port, adapted to the crate's MSRV 1.85. It uses `as` casts
+  - `f16_to_f32(bits)`: the §5 port, written for the crate's then-MSRV 1.85 (the MSRV is 1.88 since M4: simd-json 0.18 already required it). It uses `as` casts
     instead of `cast_signed`/`cast_unsigned` (stable since 1.87; §14 row), and no `unsafe`
     around `f32::from_bits`, which clippy `-D warnings` rejects.
 

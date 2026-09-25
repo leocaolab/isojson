@@ -2,7 +2,7 @@
 name = "isojson"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Fast JSON for CPython that is safe in per-interpreter-GIL sub-interpreters (PEP 684)"
 license = "Apache-2.0"
 repository = "https://github.com/leocaolab/isojson"
