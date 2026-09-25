@@ -146,10 +146,10 @@ M0 pure core ──► M1 cache + guard + datetime ──► M2 numpy ──► 
 | Milestone | Issue | Status |
 |---|---|---|
 | (milestone) | GitHub milestone #1 "isojson 0.2" (leocaolab/isojson) | created |
-| M0 | leocaolab/isojson#1 | open |
-| M1 | leocaolab/isojson#2 | open |
-| M2 | leocaolab/isojson#3 | open |
-| M3 | leocaolab/pyronova#9 (tracked by leocaolab/isojson#5) | open |
+| M0 | leocaolab/isojson#1 | done (#6) |
+| M1 | leocaolab/isojson#2 | done (#7) |
+| M2 | leocaolab/isojson#3 | done (#8) |
+| M3 | leocaolab/pyronova#9 (tracked by leocaolab/isojson#5) | done (pyronova#10) |
 | M4 | leocaolab/isojson#4 | open |
 
 Commands run (2026-09-24):

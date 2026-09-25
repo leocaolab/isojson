@@ -11,6 +11,7 @@ Datetime rows: DV-1, 3, 4a, 4b, 12, 15, 17. numpy rows: DV-5…11, 13, 14, 16.
 """
 
 import datetime as dt
+import os
 import re
 import subprocess
 import sys
@@ -28,7 +29,9 @@ import pytz
 import isojson
 from oracle.python_api import NoAnswer, expected_text
 
-assert orjson.__version__ == "3.12.0", "the §1b rows were measured on orjson 3.12.0"
+# the latest-orjson CI job (non-blocking) sets ISOJSON_ORJSON_ANY=1 to see what changed
+if os.environ.get("ISOJSON_ORJSON_ANY") != "1":
+    assert orjson.__version__ == "3.12.0", "the §1b rows were measured on orjson 3.12.0"
 
 NAIVE_UTC = isojson.OPT_NAIVE_UTC
 UTC_Z = isojson.OPT_UTC_Z

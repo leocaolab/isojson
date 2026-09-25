@@ -9,6 +9,7 @@ Datetime part, then numpy (with and without `default`, compact and
 """
 
 import datetime as dt
+import os
 import itertools
 import random
 import zoneinfo
@@ -20,7 +21,9 @@ import pytz
 
 import isojson
 
-assert orjson.__version__ == "3.12.0"
+# the latest-orjson CI job (non-blocking) sets ISOJSON_ORJSON_ANY=1 to see what changed
+if os.environ.get("ISOJSON_ORJSON_ANY") != "1":
+    assert orjson.__version__ == "3.12.0"
 
 DT_OPTS = [
     isojson.OPT_NAIVE_UTC,
