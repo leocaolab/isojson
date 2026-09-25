@@ -18,6 +18,7 @@ use crate::datetime::{dt64_to_parts, parse_dt64, Dt64Err, Dt64Unit};
 use crate::decline::{classify, Check, Elem, Reason};
 use crate::encode::{write_datetime, write_int, Encoder};
 use crate::float::{f16_to_f32, write_f32, write_f64};
+use crate::out::Out;
 use crate::types::NumpyTypes;
 use crate::{PyErrSet, R};
 
@@ -187,6 +188,85 @@ macro_rules! leaf {
     };
 }
 
+/// Writes a whole compact row `[a,b,…]` of `n` elements `stride` apart.
+type RowFn = unsafe fn(&mut Out, *const u8, isize, isize);
+
+/// A compact integer row, written through a raw pointer after one reserve:
+/// no per-element capacity check or `Result`. Integers can't be declined.
+unsafe fn write_int_row<T: itoa::Integer>(out: &mut Out, p: *const u8, n: isize, stride: isize) {
+    // the longest integer text is 20 bytes, plus a comma, plus the brackets
+    out.reserve(n as usize * 21 + 2);
+    let base = out.as_mut_ptr();
+    let mut dst = base.add(out.len());
+    *dst = b'[';
+    dst = dst.add(1);
+    let mut buf = itoa::Buffer::new();
+    for i in 0..n {
+        if i > 0 {
+            *dst = b',';
+            dst = dst.add(1);
+        }
+        let s = buf.format(rd::<T>(p.offset(i * stride)));
+        dst = copy_digits(s.as_bytes(), dst);
+    }
+    *dst = b']';
+    dst = dst.add(1);
+    out.set_len(dst.offset_from(base) as usize);
+}
+
+/// Copy `s` (at most 20 bytes) to `dst` with fixed-size, possibly
+/// overlapping copies, as `small_copy` does, and return the end. Never reads
+/// or writes outside `s` / `dst[..s.len()]`.
+#[inline(always)]
+unsafe fn copy_digits(s: &[u8], dst: *mut u8) -> *mut u8 {
+    let n = s.len();
+    let src = s.as_ptr();
+    if n >= 8 {
+        ptr::copy_nonoverlapping(src, dst, 8);
+        ptr::copy_nonoverlapping(src.add(n - 8), dst.add(n - 8), 8);
+        if n > 16 {
+            ptr::copy_nonoverlapping(src.add(8), dst.add(8), 8);
+        }
+    } else if n >= 4 {
+        ptr::copy_nonoverlapping(src, dst, 4);
+        ptr::copy_nonoverlapping(src.add(n - 4), dst.add(n - 4), 4);
+    } else {
+        for i in 0..n {
+            *dst.add(i) = *src.add(i);
+        }
+    }
+    dst.add(n)
+}
+
+fn int_row(elem: Elem) -> Option<RowFn> {
+    Some(match elem {
+        Elem::I8 => write_int_row::<i8>,
+        Elem::I16 => write_int_row::<i16>,
+        Elem::I32 => write_int_row::<i32>,
+        Elem::I64 => write_int_row::<i64>,
+        Elem::U8 => write_int_row::<u8>,
+        Elem::U16 => write_int_row::<u16>,
+        Elem::U32 => write_int_row::<u32>,
+        Elem::U64 => write_int_row::<u64>,
+        _ => return None,
+    })
+}
+
+/// The longest text one element of `elem` can have.
+fn max_text(elem: Elem) -> usize {
+    match elem {
+        Elem::Bool => 5,
+        Elem::I8 | Elem::U8 => 4,
+        Elem::I16 | Elem::U16 => 6,
+        Elem::I32 | Elem::U32 => 11,
+        Elem::I64 | Elem::U64 => 20,
+        Elem::F16 | Elem::F32 => 16,
+        Elem::F64 => 24,
+        // "YYYY-MM-DDTHH:MM:SS.ffffff+00:00" quoted
+        Elem::Dt64 => 34,
+    }
+}
+
 /// The FR-6 walk: nested dims → nested lists, a 0-length dim → `[]` with no
 /// indent, and under `INDENT_2` each dim indented like a nested list (the
 /// encoder's depth + the dim). Depth is at most `nd` (numpy caps it at 64)
@@ -194,6 +274,8 @@ macro_rules! leaf {
 unsafe fn walk<L>(
     enc: &mut Encoder,
     a: &PyArrayInterface,
+    row_bytes: usize,
+    fast_row: Option<RowFn>,
     dim: usize,
     p: *const u8,
     leaf: &mut L,
@@ -210,6 +292,14 @@ where
     let last = dim + 1 == a.nd as usize;
     let indent = enc.indent();
     let level = enc.depth + dim as u32;
+    if last && !indent {
+        if let Some(row) = fast_row {
+            row(&mut enc.out, p, n, stride);
+            return Ok(());
+        }
+        // one reserve per row: the leaves' own capacity checks never grow it
+        enc.out.reserve(n as usize * row_bytes + 2);
+    }
     enc.out.push(b'[');
     for i in 0..n {
         if i > 0 {
@@ -222,7 +312,7 @@ where
         if last {
             leaf(enc, q)?;
         } else {
-            walk(enc, a, dim + 1, q, leaf)?;
+            walk(enc, a, row_bytes, fast_row, dim + 1, q, leaf)?;
         }
     }
     if indent {
@@ -285,7 +375,15 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
     macro_rules! run {
         ($leaf:expr) => {{
             let mut leaf = $leaf;
-            walk(enc, a, 0, data, &mut leaf)
+            walk(
+                enc,
+                a,
+                max_text(elem) + 1,
+                int_row(elem),
+                0,
+                data,
+                &mut leaf,
+            )
         }};
     }
     let r = leaf!(elem, unit, run);
@@ -335,11 +433,13 @@ pub(crate) unsafe fn serialize_scalar(
     } else {
         None
     };
-    let held = match interface(enc, obj) {
-        Ok(i) => i,
-        Err(e) => return Some(Outcome::Error(e)),
-    };
-    let data = (*held.iface).data as *const u8;
+    // O-2: the value is read from the scalar's layout, right after the
+    // object header (numpy's `Py<Type>ScalarObject { PyObject_HEAD; obval }`),
+    // as orjson does; measured several times faster than a capsule per scalar
+    let data = obj
+        .cast::<u8>()
+        .add(core::mem::size_of::<PyObject>())
+        .cast_const();
     macro_rules! one {
         ($leaf:expr) => {{
             let leaf = $leaf;
@@ -347,7 +447,6 @@ pub(crate) unsafe fn serialize_scalar(
         }};
     }
     let r = leaf!(elem, unit, one);
-    drop(held);
     Some(match r {
         Ok(()) => Outcome::Written,
         Err(reason) => Outcome::Declined(reason),
