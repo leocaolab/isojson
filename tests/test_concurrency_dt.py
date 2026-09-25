@@ -1,21 +1,13 @@
-"""E2E-6: datetimes under concurrent own-GIL sub-interpreters (3.13, 3.14).
+"""E2E-6: datetimes under concurrent own-GIL sub-interpreters.
 
 4 and 8 interpreters driven by 8 threads, then 200 create/destroy cycles,
 each with its own seeded aware/naive datetime payload checked byte for byte
 against `isoformat()`, all in a child under `PYTHONMALLOC=debug`. Datetime
-types are process-static on 3.13+, so type separation is E2E-3's job; this
+types are process-static, so type separation is E2E-3's job; this
 proves the shared types are used safely.
 
 Tripwire: isojson reference-counts `_datetime`'s shared types from several
 interpreters, which is race-free only because they are immortal (C1).
-
-3.14 only. CPython 3.13.15's own `_datetime` can't run this, with isojson
-neither imported nor called (measured in M1, macOS arm64): strict
-interpreters importing `datetime` concurrently die with SIGSEGV (5/5 runs);
-under `PYTHONMALLOC=debug`, sequentially imported but concurrently used
-`datetime` objects corrupt memory (10/10); and this test's workload with
-creation, import and destruction serialized still aborts (SIGABRT, 10/10).
-3.14.7 passes all three. isojson can't make 3.13's datetime safe here.
 """
 
 import datetime
@@ -24,7 +16,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
 
 
 WORKER = textwrap.dedent(
@@ -105,20 +96,11 @@ DRIVER = textwrap.dedent(
 )
 
 
-@pytest.mark.skipif(sys.version_info < (3, 13), reason="3.12 is E2E-7")
 def test_immortal_shared_types_tripwire():
     for t in (datetime.datetime, datetime.date, datetime.time):
-        if hasattr(sys, "_is_immortal"):
-            assert sys._is_immortal(t), t
-        else:
-            assert sys.getrefcount(t) == 2**32 - 1, (t, sys.getrefcount(t))
+        assert sys._is_immortal(t), t
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 14),
-    reason="3.14+: CPython 3.13's own _datetime crashes under concurrent strict "
-    "interpreters with no isojson involved (see module doc); 3.12 is E2E-7",
-)
 def test_concurrent_interpreters_and_cycles():
     tests = os.path.dirname(os.path.abspath(__file__))
     src = DRIVER.replace("TESTS", repr(tests)).replace("WORKER_SRC", repr(WORKER))

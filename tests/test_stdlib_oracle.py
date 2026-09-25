@@ -5,7 +5,10 @@ back with `fromisoformat` to the option-adjusted source with its
 `utcoffset()`. Covers every combination of NAIVE_UTC × UTC_Z ×
 OMIT_MICROSECONDS (PASSTHROUGH_DATETIME is E2E-2's).
 
-Datetime part here; the datetime64 part arrives with numpy.
+Then datetime64: every unit × multipliers 1/2/3/7/10, sampled over the
+unit's representable i64 range plus both i64 extremes, MIN+1 and the
+0000/10000 crossings, where the output equals `expected_text` or, where that
+raises `NoAnswer`, the FR-7 (f) decline, byte for byte. Floats by value.
 """
 
 import datetime as dt
@@ -13,13 +16,14 @@ import itertools
 import random
 import zoneinfo
 
+import numpy as np
 import pytest
 import pytz
 
 import isojson
 import test_divergence as e2e4
 import test_parity_types as e2e2
-from oracle.python_api import adjusted, expected_text
+from oracle.python_api import NoAnswer, adjusted, expected_text, float_matches
 
 OPTS = [
     sum(c)
@@ -110,3 +114,90 @@ def test_random_inputs(seed):
     r = random.Random(seed)
     for _ in range(500):
         check(random_input(r), r.choice(OPTS))
+
+
+# ---- datetime64 --------------------------------------------------------------
+
+NUMPY = isojson.OPT_SERIALIZE_NUMPY
+UNITS = ["Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns", "ps", "fs", "as"]
+WORDS = {"Y": "years", "M": "months", "W": "weeks", "D": "days", "h": "hours", "m": "minutes",
+         "s": "seconds", "ms": "milliseconds", "us": "microseconds", "ns": "nanoseconds",
+         "ps": "picoseconds", "fs": "femtoseconds", "as": "attoseconds"}
+# units per µs as (num, den) for range sampling; Y/M by months
+_US = {"W": (7 * 86_400 * 10**6, 1), "D": (86_400 * 10**6, 1), "h": (3_600 * 10**6, 1),
+       "m": (60 * 10**6, 1), "s": (10**6, 1), "ms": (10**3, 1), "us": (1, 1),
+       "ns": (1, 10**3), "ps": (1, 10**6), "fs": (1, 10**9), "as": (1, 10**12)}
+I64 = np.iinfo("i8")
+
+
+def representable(unit, mult):
+    """The v range whose meaning lies in 0000-01-01 … 9999-12-31 (approx.)."""
+    if unit == "Y":
+        return -1970 // mult, 8029 // mult
+    if unit == "M":
+        return -1970 * 12 // mult, (8030 * 12 - 1) // mult
+    num, den = _US[unit]
+    lo = int(np.datetime64("0000-01-01", "D").view("i8")) * 86_400 * 10**6
+    hi = int(np.datetime64("10000-01-01", "D").view("i8")) * 86_400 * 10**6
+    return max(I64.min + 1, lo * den // (num * mult)), min(I64.max, hi * den // (num * mult))
+
+
+def dt64_values(unit, mult, r):
+    lo, hi = representable(unit, mult)
+    vs = {I64.min, I64.min + 1, I64.max, I64.max - 1, 0, 1, -1}
+    for edge in (lo, hi):
+        vs.update(v for v in range(edge - 2, edge + 3) if I64.min <= v <= I64.max)
+    vs.update(r.randint(lo, hi) for _ in range(40))
+    vs.update(r.randint(I64.min + 1, I64.max) for _ in range(5))
+    return sorted(vs)
+
+
+def check_dt64(v, unit, mult, opts):
+    x = np.array([v], dtype="i8").view(f"M8[{mult}{unit}]")[0]
+    try:
+        want = expected_text(x, opts)
+    except NoAnswer:
+        msg = f"unrepresentable numpy.datetime64: {v} {WORDS[unit]}" + (f" × {mult}" if mult != 1 else "")
+        with pytest.raises(TypeError) as e:
+            isojson.dumps(x, option=NUMPY | opts)
+        assert str(e.value) == msg
+        return False
+    assert isojson.dumps(x, option=NUMPY | opts) == want, (v, unit, mult, opts)
+    assert isojson.dumps(np.array([x]), option=NUMPY | opts) == b"[" + want + b"]"
+    return True
+
+
+@pytest.mark.parametrize("mult", [1, 2, 3, 7, 10])
+@pytest.mark.parametrize("unit", UNITS)
+def test_datetime64_against_the_exact_meaning(unit, mult):
+    r = random.Random(f"{unit}{mult}")
+    written = declined = 0
+    for v in dt64_values(unit, mult, r):
+        for opts in OPTS:
+            if check_dt64(v, unit, mult, opts):
+                written += 1
+            else:
+                declined += 1
+    lo, hi = representable(unit, mult)
+    assert written
+    # where the representable range is narrower than i64, declines were hit;
+    # otherwise (ns ×1–3, ps, fs, as) every i64 value has an answer
+    assert bool(declined) == (lo > I64.min + 1 or hi < I64.max), (declined, lo, hi)
+
+
+def test_datetime64_year_and_month_at_i64_max():
+    for unit in ("Y", "M"):
+        assert not check_dt64(I64.max, unit, 1, 0)  # numpy's astype wraps these (§1a)
+
+
+@pytest.mark.parametrize("dtype", ["f2", "f4", "f8"])
+def test_floats_by_value(dtype):
+    r = np.random.default_rng(7)
+    raw = r.integers(0, 2**63, 5000, dtype=np.uint64)
+    bits = {"f2": raw.astype(np.uint16), "f4": raw.astype(np.uint32), "f8": raw}[dtype]
+    a = bits.view(dtype)
+    texts = isojson.dumps(a, option=NUMPY)[1:-1].split(b",")
+    for t, x in zip(texts, a, strict=True):
+        assert float_matches(t, x), (t, x)
+    for x in a[:200]:
+        assert float_matches(isojson.dumps(x, option=NUMPY), x)

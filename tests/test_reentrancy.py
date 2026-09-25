@@ -74,6 +74,7 @@ EXPECTED = {
 VARIANTS = {
     "no-default": "KW = {}",
     "default": "KW = {'default': repr}",
+    "numpy": "KW = {'option': isojson.OPT_SERIALIZE_NUMPY}",
 }
 
 

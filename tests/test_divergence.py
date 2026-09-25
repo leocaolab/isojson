@@ -7,7 +7,7 @@ differs from orjson 3.12.0. Each proves both halves:
     error;
 (c) isojson == (b).
 
-Datetime rows (DV-1, 3, 4a, 4b, 12, 15, 17) here; the numpy rows (DV-5…11, 13, 14, 16) arrive with numpy.
+Datetime rows: DV-1, 3, 4a, 4b, 12, 15, 17. numpy rows: DV-5…11, 13, 14, 16.
 """
 
 import datetime as dt
@@ -17,12 +17,16 @@ import sys
 import textwrap
 import zoneinfo
 
+import json
+import warnings
+
+import numpy as np
 import orjson
 import pytest
 import pytz
 
 import isojson
-from oracle.python_api import expected_text
+from oracle.python_api import NoAnswer, expected_text
 
 assert orjson.__version__ == "3.12.0", "the §1b rows were measured on orjson 3.12.0"
 
@@ -208,3 +212,157 @@ def test_dv17_time_microsecond_leading_zero(us):
     ref = expected_text(x)
     assert ref == f'"00:00:01.0{us}"'.encode()  # (b)
     assert isojson.dumps(x) == ref  # (c)
+
+
+# ---- numpy rows --------------------------------------------------------------
+
+NUMPY = isojson.OPT_SERIALIZE_NUMPY
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    NaT = np.datetime64("NaT")
+# numpy 2.5 warns on every generic-unit datetime64, NaT included (§15.3)
+pytestmark = pytest.mark.filterwarnings("ignore:The 'generic' unit:DeprecationWarning")
+
+
+def o_err(x, **kw):
+    try:
+        orjson.dumps(x, option=NUMPY, **kw)
+    except TypeError as e:
+        return str(e)
+    raise AssertionError("orjson did not raise")
+
+
+def declined(x, message):
+    """(b)/(c) for a declined object: without `default` the FR-7 message
+    (plus the note); with one, `default` receives the whole object."""
+    with pytest.raises(TypeError) as e:
+        isojson.dumps(x, option=NUMPY)
+    assert str(e.value) == message
+    assert e.value.__notes__ and e.value.__notes__[0].startswith("isojson can't write")
+    seen = []
+    assert isojson.dumps({"x": x}, option=NUMPY, default=lambda a: seen.append(a) or "D") == b'{"x":"D"}'
+    assert len(seen) == 1 and seen[0] is x
+
+
+def both_forms(unit, v):
+    """The value as a 1-D array element and as a scalar."""
+    a = np.array([v], dtype="i8").view(f"M8[{unit}]") if unit else np.array([v], dtype="i8").view("M8")
+    return a, a[0]
+
+
+def native_equals_reference(x):
+    """(b)+(c) for a written array or scalar: each element's reference."""
+    xs = [x] if x.ndim == 0 else list(x)
+    ref = b"[" + b",".join(expected_text(e) for e in xs) + b"]" if x.ndim else expected_text(x)
+    assert isojson.dumps(x, option=NUMPY) == ref
+    return ref
+
+
+def test_dv5_nat_ns():
+    for x in both_forms("ns", np.iinfo("i8").min):
+        assert orjson.dumps(x, option=NUMPY).strip(b"[]") == b'"1677-09-21T00:12:43.145224"'  # (a)
+        assert native_equals_reference(x).strip(b"[]") == b"null"
+
+
+@pytest.mark.parametrize("unit", ["W", "D", "h", "m"])
+def test_dv6_nat_wraps(unit):
+    for x in both_forms(unit, np.iinfo("i8").min):
+        assert orjson.dumps(x, option=NUMPY).strip(b"[]") == b'"1970-01-01T00:00:00"'  # (a)
+        assert native_equals_reference(x).strip(b"[]") == b"null"
+
+
+@pytest.mark.parametrize("unit", ["Y", "M", "s", "ms", "us", None])
+def test_dv7_nat_raises(unit):
+    for x in both_forms(unit, np.iinfo("i8").min):
+        msg = o_err(x)  # (a)
+        assert msg.startswith("unrepresentable") if unit else msg == "unsupported numpy.datetime64 unit: NaT"
+        assert native_equals_reference(x).strip(b"[]") == b"null"
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "code",
+    [
+        "np.array([1], dtype='M8[10ms]')",
+        "np.array([1], dtype='M8[2D]')",
+        "np.datetime64(1, '10ms')",
+        "np.array(['1969-12'], dtype='M8[M]')",
+    ],
+)
+def test_dv8_dv9_orjson_dies(code):
+    assert died_in_child(
+        f"import numpy as np, orjson\norjson.dumps({code}, option=orjson.OPT_SERIALIZE_NUMPY)"
+    )  # (a)
+    x = eval(code, {"np": np})  # noqa: S307
+    native_equals_reference(x)  # (b), (c)
+
+
+def test_dv8_values():
+    assert isojson.dumps(np.array([1], dtype="M8[10ms]"), option=NUMPY) == b'["1970-01-01T00:00:00.010000"]'
+    assert isojson.dumps(np.array([1], dtype="M8[2D]"), option=NUMPY) == b'["1970-01-03T00:00:00"]'
+
+
+def test_dv9_months_before_1970():
+    x = np.array(["1969-11"], dtype="M8[M]")
+    assert o_err(x) == "unrepresentable numpy.datetime64: -2 months"  # (a)
+    assert native_equals_reference(x) == b'["1969-11-01T00:00:00"]'
+    assert isojson.dumps(np.array(["1969-12"], dtype="M8[M]"), option=NUMPY) == b'["1969-12-01T00:00:00"]'
+
+
+@pytest.mark.parametrize("unit", ["D", "h", "m", "s", "ms", "us"])
+def test_dv10_last_day(unit):
+    x = np.array(["9999-12-31"], dtype=f"M8[{unit}]")
+    assert o_err(x).startswith("unrepresentable numpy.datetime64: ")  # (a)
+    assert native_equals_reference(x) == b'["9999-12-31T00:00:00"]'
+
+
+def test_dv11_overflow_declined():
+    x = np.array([307445734561825861], dtype="M8[m]")
+    assert orjson.dumps(x, option=NUMPY) == b'["1970-01-01T00:00:44"]'  # (a): wrapped
+    with pytest.raises(NoAnswer):  # (b): no answer in 0000–9999
+        expected_text(x[0])
+    declined(x, "unrepresentable numpy.datetime64: 307445734561825861 minutes")  # (c)
+
+
+def test_dv13_generic_value_declined():
+    for x in both_forms(None, 5):
+        assert o_err(x) == "unsupported numpy.datetime64 unit: NaT"  # (a): misnames the value
+        with pytest.raises(NoAnswer):  # (b)
+            expected_text(x if x.ndim == 0 else x[0])
+        declined(x, "unsupported numpy.datetime64 unit: generic")  # (c)
+
+
+DV14 = [
+    np.array([["NaT"], ["2026-01-01"]], dtype="M8[s]"),
+    np.array([["2026-01-01"], ["10000-01-01"]], dtype="M8[s]"),
+    np.array([[5], [6]], dtype="i8").view("M8[ps]"),
+    np.array([[NaT], [NaT]]),
+    np.array([[5], [6]], dtype="i8").view("M8"),
+]
+
+
+@pytest.mark.parametrize("x", DV14, ids=["nat", "out-of-range", "ps", "generic-nat", "generic-value"])
+def test_dv14_malformed_json(x):
+    for kw in ({}, {"default": str}):
+        with pytest.raises(json.JSONDecodeError):  # (a): malformed, even with default
+            json.loads(orjson.dumps({"x": x, "y": 1}, option=NUMPY, **kw))
+    flat = [e for row in x for e in row]
+    try:
+        ref = b"[" + b",".join(b"[" + expected_text(e) + b"]" for e in flat) + b"]"  # (b)
+    except NoAnswer:
+        # (c) declined per FR-7 (e)/(f): default gets the whole array
+        assert isojson.dumps({"x": x, "y": 1}, option=NUMPY, default=lambda a: "D") == b'{"x":"D","y":1}'
+        return
+    out = isojson.dumps({"x": x, "y": 1}, option=NUMPY)  # (c)
+    assert out == b'{"x":' + ref + b',"y":1}'
+    json.loads(out)
+
+
+@pytest.mark.parametrize("unit", ["ps", "fs", "as"])
+def test_dv16_sub_microsecond_units(unit):
+    x = np.array([5, -1, np.iinfo("i8").max, np.iinfo("i8").min], dtype="i8").view(f"M8[{unit}]")
+    names = {"ps": "picoseconds", "fs": "femtoseconds", "as": "attoseconds"}
+    assert o_err(x) == f"unsupported numpy.datetime64 unit: {names[unit]}"  # (a)
+    assert o_err(x, default=str) == f"unsupported numpy.datetime64 unit: {names[unit]}"  # even with default
+    native_equals_reference(x)  # (b), (c)
+    native_equals_reference(x[0])

@@ -5,10 +5,6 @@
 //! `Reason` from the rule it names plus the raw evidence it reads (`dtype.str`,
 //! flags, shape, value); `reason_message` is the error text (orjson's where
 //! orjson has one) and `reason_note` the `add_note` text with that evidence.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired into numpy.rs in M2 (isojson#3)")
-)]
 
 use crate::datetime::{Dt64Unit, Unit};
 

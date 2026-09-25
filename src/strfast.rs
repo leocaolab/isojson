@@ -1,7 +1,7 @@
 //! Reading a `str`'s UTF-8 without a function call.
 //!
 //! CPython does not expose this in its public API, so this module mirrors the
-//! object header layout of CPython 3.12–3.14 (GIL builds): a compact ASCII
+//! object header layout of CPython 3.14 (GIL builds): a compact ASCII
 //! string stores its characters right after `PyASCIIObject`, and a compact
 //! non-ASCII string keeps a cached UTF-8 pointer in `PyCompactUnicodeObject`.
 //!
@@ -34,7 +34,7 @@ struct CompactUnicodeObject {
     utf8: *const u8,
 }
 
-// state bits (GIL builds, 3.12–3.14): interned:2, kind:3, compact:1, ascii:1
+// state bits (GIL builds, 3.14): interned:2, kind:3, compact:1, ascii:1
 const COMPACT: u32 = 1 << 5;
 const ASCII: u32 = 1 << 6;
 

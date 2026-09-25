@@ -20,7 +20,7 @@ ImportError: module orjson.orjson does not support loading in subinterpreters
 pip install isojson
 ```
 
-Wheels are published for CPython 3.12, 3.13 and 3.14 on Linux (x86_64,
+Wheels are published for CPython 3.14 on Linux (x86_64,
 aarch64), macOS (arm64, x86_64) and Windows (x86_64).
 
 ```python
@@ -79,7 +79,7 @@ worker checks its own seeded data against its own expected answer, so a
 leak between threads or interpreters shows up as a wrong result, not just
 as a crash that may or may not happen.
 
-**Free-threaded CPython (3.13t / 3.14t):** isojson works there, but it is
+**Free-threaded CPython (3.14t):** isojson works there, but it is
 not free-threading-ready yet. The module declares that it needs the GIL, so
 CPython re-enables the GIL when it is imported and prints a `RuntimeWarning`.
 We checked this on 3.14t. The `str` fast path is also off on those builds.
@@ -140,7 +140,7 @@ requirements.
   escaping scans 16 bytes at a time: SSE2 on x86_64 and NEON on aarch64, both
   part of those architectures' baseline, so no runtime detection is needed.
 - **`str` contents are read from the object header, after a self-check.**
-  Where CPython 3.12–3.14 already holds a string's UTF-8 (compact ASCII, or a
+  Where CPython 3.14 already holds a string's UTF-8 (compact ASCII, or a
   cached UTF-8 copy), isojson reads it directly instead of calling
   `PyUnicode_AsUTF8AndSize`. That layout is not public API. So at import,
   isojson compares its reading with the API on probe strings and turns the
@@ -220,7 +220,7 @@ isojson's own tests cover the case.
 | `orjson.Fragment` | ❌ | ✅ | ❌ |
 | Integers beyond 64 bits in `dumps` | ❌ (like orjson) | ❌ | ✅ |
 | NaN / ±Infinity in `dumps` | `null` (like orjson) | `null` | `NaN` / `Infinity` |
-| Python versions | CPython 3.12–3.14 | CPython 3.10+ | all |
+| Python versions | CPython 3.14 | CPython 3.10+ | all |
 
 ## Differences from orjson
 
@@ -243,8 +243,10 @@ result as orjson 3.12 (the test suite checks this, see [Testing](#testing)).
 - **`loads` error messages differ.** The exception type (`JSONDecodeError`,
   a subclass of `json.JSONDecodeError` and `ValueError`) and `.pos` / `.lineno`
   / `.colno` match. The wording of `.msg` does not always match orjson's.
-- **CPython 3.12–3.14 only.** Per-interpreter GIL arrived in 3.12. On
-  free-threaded builds (3.13t/3.14t) the module declares that it needs the
+- **CPython 3.14 only.** Per-interpreter GIL arrived in 3.12, but 3.12's
+  and 3.13's own `_datetime` isn't usable from concurrent strict
+  sub-interpreters, so isojson targets 3.14. On free-threaded builds (3.14t)
+  the module declares that it needs the
   GIL, so CPython re-enables it on import (see above).
 
 ## Performance

@@ -8,13 +8,6 @@
 //! turned into calendar parts by the meaning numpy's API defines: `v × mult`
 //! units since 1970-01-01T00:00, sub-µs units floored to µs, months by floor
 //! division, all arithmetic checked (design FR-9, §8.3).
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired into encode.rs in M1 (isojson#2) and numpy.rs in M2 (isojson#3)"
-    )
-)]
 
 use crate::{OPT_OMIT_MICROSECONDS, OPT_UTC_Z};
 

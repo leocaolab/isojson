@@ -224,9 +224,8 @@ def test_default():
 def test_invalid_opts():
     assert _err(isojson.dumps, 1, option=9999999) == _err(orjson.dumps, 1, option=9999999)
     assert _err(isojson.dumps, 1, option="x")[0] is TypeError
-    for opt in (isojson.OPT_NON_STR_KEYS, isojson.OPT_SERIALIZE_NUMPY):
-        with pytest.raises(TypeError, match="does not support"):
-            isojson.dumps({}, option=opt)
+    with pytest.raises(TypeError, match="does not support"):
+        isojson.dumps({}, option=isojson.OPT_NON_STR_KEYS)
 
 
 DECODE_OK = [
@@ -350,7 +349,7 @@ def test_output_growth():
 
 
 def test_str_fast_path_is_active():
-    """On CPython 3.12-3.14 GIL builds the import-time self-check must pass;
+    """On CPython 3.14 GIL builds the import-time self-check must pass;
     if it silently failed, isojson would still be correct but slower."""
     import sysconfig
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
