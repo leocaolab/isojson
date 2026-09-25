@@ -286,6 +286,17 @@ def _median(fn):
     return bench(fn, calibrate(fn))[0]
 
 
+def _pair(a_fn, b_fn):
+    """Median seconds of two functions on the same payload, after both have
+    run once. Large outputs leave the allocator in a different state (on
+    glibc a ~20 MB output can be a fresh mmap, page-faulted on every call,
+    until some large free raises the mmap threshold); warming both first
+    puts them in the same state, whichever is measured first."""
+    a_fn()
+    b_fn()
+    return _median(a_fn), _median(b_fn)
+
+
 def baseline_cells():
     """Median seconds for the cells 0.1 can run: every single() cell (NFR-1)
     and NFR-5's `default` path without the numpy option. Run by --baseline."""
@@ -339,8 +350,8 @@ def types():
     for nfr_id, cases in nfr_payloads().items():
         for name, obj, _ in cases:
             opt = 0 if nfr_id == "NFR-2" else NUMPY
-            a = _median(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt))
-            b = _median(lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
+            a, b = _pair(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt),
+                         lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
             print(f"| {name} | {fmt_time(a)} | {fmt_time(b)} | {a / b:.2f}× |")
 
 
@@ -356,8 +367,8 @@ def nfr(baseline_python):
     for nfr_id, cases in nfr_payloads().items():
         for name, obj, _ in cases:
             opt = 0 if nfr_id == "NFR-2" else NUMPY
-            a = _median(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt))
-            b = _median(lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
+            a, b = _pair(lambda obj=obj, opt=opt: isojson.dumps(obj, option=opt),
+                         lambda obj=obj, opt=opt: orjson.dumps(obj, option=opt))
             rows.append((nfr_id, name, "orjson", a, b, a / b <= limits[nfr_id]))
 
     out = subprocess.run([baseline_python, __file__, "baseline-cells"], capture_output=True, text=True, check=True)
