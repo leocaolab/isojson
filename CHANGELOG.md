@@ -66,8 +66,13 @@ Python's own API says, or declines. Every row has a regression test.
 - `utcoffset()` is called the way CPython's `datetime.utcoffset()` calls
   it, without its format-string call: aware datetimes are faster than
   orjson's.
-- Plain-JSON `dumps` is 3–5% slower than 0.1 (a few ns per call and per
-  element; leocaolab/isojson#10).
+- Floats are formatted in place in the output. 0.1 formatted each into a
+  stack buffer and copied it out, which x86_64 can't store-forward: floats in
+  [0, 1), normals and integral floats took up to twice orjson's time on
+  Linux; they are now at parity.
+- Plain-JSON `dumps` is 2–7% slower than 0.1 (a few ns per call and per
+  element), and a list of objects bound for `default` with
+  `OPT_SERIALIZE_NUMPY` up to 13% on Linux (leocaolab/isojson#10).
 
 ## 0.1.0
 

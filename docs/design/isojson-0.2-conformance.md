@@ -35,14 +35,26 @@ true as the files move.
 - **C7 done:** README (feature table, differences mirrored from §1b and
   checked by E2E-9 (3), limitations, testing, status, half-rs), crate doc,
   code comments, CHANGELOG.
-- **NFR-1…6:** measured with `python bench/bench.py nfr --baseline <0.1>`
-  on macOS arm64 and Linux x86_64; numbers go in the release notes.
-  NFR-6 is E2E-6. **NFR-1 is not met and was accepted:** `dumps` is 3–5%
-  slower than 0.1 on 0.1's payloads (macOS arm64, quiet box, same-toolchain
-  0.1 baseline); the FR-13 guard itself measures zero. Maintainer,
-  2026-09-25: accepted for 0.2.0, to optimize later — leocaolab/isojson#10.
-  NFR-2…5 pass on macOS (NFR-2 0.76×, NFR-3 0.68–1.09×, NFR-4 0.84–0.87×,
-  NFR-5 1.08×).
+- **NFR-1…6** (`python bench/bench.py nfr --baseline <0.1>`; 0.1 and 0.2
+  cells in identical fresh processes; libraries warmed before each pair).
+  CPython 3.14.7, orjson 3.12.0, 2026-09-25:
+
+  | NFR | threshold | macOS arm64 (M5 Pro) | Linux x86_64 (7840HS) | |
+  |---|---|---|---|---|
+  | NFR-1 0.1 payloads | within ±3% | `dumps` +4–7%, `loads` 0–4% | `dumps` +2–4%, `loads` −1–7% (noise) | **accepted** (#10) |
+  | NFR-2 datetime records | ≤ 1.2× orjson | 0.79× | 1.04× | ✅ |
+  | NFR-3 numpy arrays | ≤ 1.2× | 0.69×, 0.71×, 1.08× | 1.01×, 1.02×, 1.03× | ✅ |
+  | NFR-4 numpy scalars | ≤ 1.3× | 0.71×, 0.75× | 1.08×, 1.09× | ✅ |
+  | NFR-5 `default` path with the numpy option | ≤ 1.10× of 0.1 | 1.02× | 1.13× | ❌ Linux, recorded in #10 |
+  | NFR-6 concurrency | 0 failures | E2E-6 green | E2E-6 green (CI) | ✅ |
+
+  NFR-1 was accepted by the maintainer (2026-09-25); NFR-5 on Linux is the
+  same per-object overhead and is recorded with it in leocaolab/isojson#10.
+  Found and fixed while measuring: floats formatted in a stack buffer and
+  copied out (x86 store-forwarding; NFR-3/4 were 1.5–1.8× on Linux), the FR-13
+  guard referencing leaves, a whole-row reserve for long rows, a
+  `sys.modules` lookup per `default`-bound object (FR-3 now once per call),
+  and `datetime.utcoffset()`'s format-string call (NFR-2).
 
 ## Where the build changed the design (each recorded in the design)
 

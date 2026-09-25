@@ -303,7 +303,9 @@ is undefined behaviour there).
 
 Reproduce with `python bench/bench.py`. Each cell is the median of repeated
 runs. Parallel cells time only the work loop: interpreter or process
-creation and imports happen before timing starts.
+creation and imports happen before timing starts. The single-interpreter
+and datetime/numpy tables are isojson 0.2.0; the parallel tables were
+measured with 0.1.0 (0.2's per-call `dumps` is within 2–7% of 0.1's).
 
 ### macOS arm64: Apple M5 Pro, 18 cores, CPython 3.14.7, orjson 3.12.0
 
@@ -343,39 +345,40 @@ How to read this:
 
 | `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 47 ns | 46 ns | 594 ns | 1.03× |
-| records ×100 | 18.33 µs | 17.04 µs | 153.80 µs | 1.08× |
-| records ×2000 | 349.52 µs | 298.00 µs | 2.86 ms | 1.17× |
-| floats ×10k | 111.83 µs | 209.36 µs | 2.39 ms | **0.53×** |
-| unicode/escapes ×200 | 12.88 µs | 11.05 µs | 124.12 µs | 1.17× |
+| small (27 B) | 49 ns | 43 ns | 567 ns | 1.14× |
+| records ×100 | 18.04 µs | 15.83 µs | 145.72 µs | 1.14× |
+| records ×2000 | 342.46 µs | 279.09 µs | 2.73 ms | 1.23× |
+| floats ×10k | 95.87 µs | 188.74 µs | 2.21 ms | **0.51×** |
+| unicode/escapes ×200 | 12.43 µs | 9.97 µs | 107.87 µs | 1.25× |
 
 | `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 107 ns | 101 ns | 1.09 µs | 1.06× |
-| records ×100 | 62.46 µs | 45.94 µs | 111.03 µs | 1.36× |
-| records ×2000 | 1.39 ms | 851.92 µs | 2.16 ms | 1.63× |
-| floats ×10k | 224.24 µs | 199.21 µs | 1.14 ms | 1.13× |
-| unicode/escapes ×200 | 94.63 µs | 68.32 µs | 171.29 µs | 1.39× |
+| small (27 B) | 101 ns | 70 ns | 553 ns | 1.44× |
+| records ×100 | 49.48 µs | 38.35 µs | 101.08 µs | 1.29× |
+| records ×2000 | 1.03 ms | 777.99 µs | 2.02 ms | 1.32× |
+| floats ×10k | 195.54 µs | 162.60 µs | 1.06 ms | 1.20× |
+| unicode/escapes ×200 | 63.99 µs | 42.94 µs | 118.75 µs | 1.49× |
 
 **datetime and numpy** (`dumps`; `python bench/bench.py types`):
 
 | payload | isojson | orjson | isojson / orjson |
 |---|---:|---:|---:|
-| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 188.13 µs | 247.69 µs | **0.76×** |
-| numpy `float64` × 1M | 15.98 ms | 22.69 ms | **0.70×** |
-| numpy `float64` 1000 × 1000 | 15.69 ms | 22.76 ms | **0.69×** |
-| numpy `int64` × 1M | 7.63 ms | 6.97 ms | 1.09× |
-| 10k numpy `float64` scalars | 215.48 µs | 319.47 µs | **0.67×** |
-| 10k numpy `int64` scalars | 119.54 µs | 159.66 µs | **0.75×** |
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 182.90 µs | 236.75 µs | **0.77×** |
+| numpy `float64` × 1M | 14.89 ms | 22.45 ms | **0.66×** |
+| numpy `float64` 1000 × 1000 | 14.93 ms | 21.76 ms | **0.69×** |
+| numpy `int64` × 1M | 7.30 ms | 6.77 ms | 1.08× |
+| 10k numpy `float64` scalars | 204.75 µs | 288.92 µs | **0.71×** |
+| 10k numpy `int64` scalars | 115.96 µs | 155.99 µs | **0.74×** |
 
 Aware datetimes are faster than orjson's because the offset comes from one
 `tzinfo.utcoffset(dt)` call, checked the way CPython checks it, while orjson
 probes the tzinfo's attributes first. `float64` arrays and scalars share the
 float writer that makes float-heavy documents fast.
 
-In summary: `dumps` is within 1.2× of orjson on plain JSON, about 2× faster on
-float-heavy documents, and faster on datetimes and numpy `float64`. `loads` is 1.1–1.6× slower than orjson. Both are
-1.5–21× faster than stdlib `json`.
+In summary, on this machine: `dumps` is 1.1–1.25× orjson's time on plain
+JSON, about 2× faster on float-heavy documents, and faster on datetimes and
+numpy. `loads` is 1.2–1.5× slower than orjson. Both are 1.5–23× faster than
+stdlib `json`.
 
 The remaining `loads` gap is mostly fixed per-call cost around simd-json:
 the input is copied (simd-json unescapes in place, and `bytes` are
@@ -404,23 +407,38 @@ the fastest row (98k).
 
 | `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 78 ns | 79 ns | 933 ns | 0.99× |
-| records ×100 | 27.25 µs | 19.83 µs | 171.77 µs | 1.37× |
-| records ×2000 | 736.39 µs | 382.51 µs | 3.99 ms | 1.93× |
-| floats ×10k | 180.59 µs | 183.01 µs | 3.23 ms | 0.99× |
-| unicode/escapes ×200 | 16.93 µs | 13.93 µs | 107.23 µs | 1.22× |
+| small (27 B) | 79 ns | 70 ns | 793 ns | 1.14× |
+| records ×100 | 24.73 µs | 17.19 µs | 148.74 µs | 1.44× |
+| records ×2000 | 660.35 µs | 336.80 µs | 3.37 ms | 1.96× |
+| floats ×10k | 164.61 µs | 163.90 µs | 2.81 ms | 1.00× |
+| unicode/escapes ×200 | 14.44 µs | 11.82 µs | 92.46 µs | 1.22× |
 
 | `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 146 ns | 128 ns | 948 ns | 1.13× |
-| records ×100 | 78.60 µs | 54.66 µs | 151.23 µs | 1.44× |
-| records ×2000 | 1.67 ms | 1.17 ms | 3.10 ms | 1.42× |
-| floats ×10k | 300.53 µs | 188.56 µs | 1.58 ms | 1.59× |
-| unicode/escapes ×200 | 87.24 µs | 54.87 µs | 164.43 µs | 1.59× |
+| small (27 B) | 130 ns | 114 ns | 848 ns | 1.14× |
+| records ×100 | 69.21 µs | 47.23 µs | 130.90 µs | 1.47× |
+| records ×2000 | 1.42 ms | 989.92 µs | 2.72 ms | 1.43× |
+| floats ×10k | 262.10 µs | 166.52 µs | 1.40 ms | 1.57× |
+| unicode/escapes ×200 | 78.41 µs | 49.52 µs | 147.87 µs | 1.58× |
+
+**datetime and numpy** (`dumps`):
+
+| payload | isojson | orjson | isojson / orjson |
+|---|---:|---:|---:|
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 286.39 µs | 277.75 µs | 1.03× |
+| numpy `float64` × 1M | 18.04 ms | 17.84 ms | 1.01× |
+| numpy `float64` 1000 × 1000 | 17.95 ms | 17.66 ms | 1.02× |
+| numpy `int64` × 1M | 9.53 ms | 9.30 ms | 1.02× |
+| 10k numpy `float64` scalars | 281.20 µs | 274.20 µs | 1.03× |
+| 10k numpy `int64` scalars | 176.61 µs | 218.76 µs | **0.81×** |
 
 Per call, x86_64 is harder on isojson than arm64. `dumps` of large record
-documents is 1.9× slower than orjson here, against 1.2× on the Mac, and `loads`
-is 1.1–1.6× slower. Both are still 1.9–18× faster than stdlib `json`.
+documents is 2.0× slower than orjson here, against 1.2× on the Mac, and
+`loads` is 1.1–1.6× slower; datetimes and numpy are at parity. Both are still
+1.9–19× faster than stdlib `json`. Floats are at parity since 0.2, which
+writes them in place in the output: 0.1 formatted each into a stack buffer and
+copied it out, which x86_64 can't store-forward (floats in [0, 1) or integral
+floats took up to twice orjson's time).
 
 ### Across both machines
 
