@@ -37,7 +37,12 @@ true as the files move.
   code comments, CHANGELOG.
 - **NFR-1…6:** measured with `python bench/bench.py nfr --baseline <0.1>`
   on macOS arm64 and Linux x86_64; numbers go in the release notes.
-  NFR-6 is E2E-6.
+  NFR-6 is E2E-6. **NFR-1 is not met and was accepted:** `dumps` is 3–5%
+  slower than 0.1 on 0.1's payloads (macOS arm64, quiet box, same-toolchain
+  0.1 baseline); the FR-13 guard itself measures zero. Maintainer,
+  2026-09-25: accepted for 0.2.0, to optimize later — leocaolab/isojson#10.
+  NFR-2…5 pass on macOS (NFR-2 0.76×, NFR-3 0.68–1.09×, NFR-4 0.84–0.87×,
+  NFR-5 1.08×).
 
 ## Where the build changed the design (each recorded in the design)
 

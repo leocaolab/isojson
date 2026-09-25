@@ -66,6 +66,8 @@ Python's own API says, or declines. Every row has a regression test.
 - `utcoffset()` is called the way CPython's `datetime.utcoffset()` calls
   it, without its format-string call: aware datetimes are faster than
   orjson's.
+- Plain-JSON `dumps` is 3–5% slower than 0.1 (a few ns per call and per
+  element; leocaolab/isojson#10).
 
 ## 0.1.0
 
