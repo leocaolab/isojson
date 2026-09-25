@@ -224,9 +224,8 @@ def test_default():
 def test_invalid_opts():
     assert _err(isojson.dumps, 1, option=9999999) == _err(orjson.dumps, 1, option=9999999)
     assert _err(isojson.dumps, 1, option="x")[0] is TypeError
-    for opt in (isojson.OPT_NON_STR_KEYS, isojson.OPT_SERIALIZE_NUMPY):
-        with pytest.raises(TypeError, match="does not support"):
-            isojson.dumps({}, option=opt)
+    with pytest.raises(TypeError, match="does not support"):
+        isojson.dumps({}, option=isojson.OPT_NON_STR_KEYS)
 
 
 DECODE_OK = [

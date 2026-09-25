@@ -18,8 +18,10 @@ use core::ffi::CStr;
 use core::ptr;
 use pyo3_ffi::*;
 
-use crate::datetime::{fmt_hms, fmt_offset, fmt_ymd};
+use crate::datetime::{fmt_hms, fmt_offset, fmt_ymd, Parts};
+use crate::decline::{reason_message, reason_note, Reason};
 use crate::float::{small_copy, write_f64};
+use crate::numpy::Outcome;
 use crate::out::Out;
 use crate::types::{DtTypes, TypeCache};
 use crate::*;
@@ -33,13 +35,11 @@ const ALL_OPTS: u32 = 4095;
 /// Options that change *how* a type we serialize natively is written, and
 /// that we do not implement. Silently ignoring them would produce output the
 /// caller did not ask for, so they are rejected.
-const UNSUPPORTED_OPTS: &[(u32, &str)] = &[
-    (OPT_NON_STR_KEYS, "OPT_NON_STR_KEYS"),
-    (OPT_SERIALIZE_NUMPY, "OPT_SERIALIZE_NUMPY"),
-];
+const UNSUPPORTED_OPTS: &[(u32, &str)] = &[(OPT_NON_STR_KEYS, "OPT_NON_STR_KEYS")];
 // OPT_PASSTHROUGH_DATACLASS only affects dataclass objects, which isojson
 // never serializes natively (they always go to `default`), so it is accepted
-// and has no effect. The datetime options take effect (design FR-5).
+// and has no effect. The datetime options and OPT_SERIALIZE_NUMPY take effect
+// (design FR-5, FR-11).
 
 static HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -72,7 +72,7 @@ unsafe fn type_name(obj: *mut PyObject) -> String {
 }
 
 /// Raise `TypeError(msg)` with the currently raised exception as `__cause__`.
-unsafe fn raise_type_error_from_current(msg: &str) {
+pub(crate) unsafe fn raise_type_error_from_current(msg: &str) {
     raise_type_error_caused_by(msg, PyErr_GetRaisedException());
 }
 
@@ -105,6 +105,60 @@ unsafe fn describe_exception(exc: *mut PyObject) -> String {
             name
         }
     }
+}
+
+fn write_ymd(out: &mut Out, y: u16, mo: u8, d: u8) {
+    let mut b = [0u8; 10];
+    let n = fmt_ymd(&mut b, y, mo, d);
+    small_copy(out, &b[..n]);
+}
+
+fn write_offset(out: &mut Out, total_us: i64, opts: u32) {
+    let mut b = [0u8; 16];
+    let n = fmt_offset(&mut b, total_us, opts);
+    small_copy(out, &b[..n]);
+}
+
+/// A quoted `YYYY-MM-DDTHH:MM:SS[.ffffff][offset]`, the datetime text of
+/// design §1a for `datetime` and `datetime64` alike.
+pub(crate) fn write_datetime(out: &mut Out, p: &Parts, offset: Option<i64>, opts: u32) {
+    out.push(b'"');
+    write_ymd(out, p.y, p.mo, p.d);
+    out.push(b'T');
+    let mut b = [0u8; 15];
+    let n = fmt_hms(&mut b, p.h, p.mi, p.s, p.us, opts);
+    small_copy(out, &b[..n]);
+    if let Some(o) = offset {
+        write_offset(out, o, opts);
+    }
+    out.push(b'"');
+}
+
+/// Attach `note` to the exception being raised (`exc.add_note(note)`). If
+/// that itself fails, its error is cleared and the original exception stands.
+unsafe fn add_note(note: &str) {
+    let exc = PyErr_GetRaisedException();
+    if exc.is_null() {
+        return;
+    }
+    let name = PyUnicode_FromString(c"add_note".as_ptr());
+    let text = PyUnicode_FromStringAndSize(note.as_ptr().cast(), note.len() as Py_ssize_t);
+    let r = if name.is_null() || text.is_null() {
+        ptr::null_mut()
+    } else {
+        PyObject_CallMethodOneArg(exc, name, text)
+    };
+    if r.is_null() {
+        PyErr_Clear();
+    } else {
+        Py_DECREF(r);
+    }
+    for o in [name, text] {
+        if !o.is_null() {
+            Py_DECREF(o);
+        }
+    }
+    PyErr_SetRaisedException(exc);
 }
 
 #[inline]
@@ -226,6 +280,28 @@ impl Encoder {
                 }
             }
         }
+        if self.opts & OPT_SERIALIZE_NUMPY != 0 {
+            match (*self.cache).numpy(ty) {
+                Err(PyErrSet) => return false,
+                Ok(Some(np)) => {
+                    let outcome = if ty == np.ndarray {
+                        Some(crate::numpy::serialize_array(self, obj))
+                    } else {
+                        crate::numpy::serialize_scalar(self, obj, np)
+                    };
+                    match outcome {
+                        Some(Outcome::Written) => return true,
+                        Some(Outcome::Error(PyErrSet)) => return false,
+                        Some(Outcome::Declined(reason)) => {
+                            return self.call_default_declined(obj, reason)
+                        }
+                        // an unrecognized numpy type: the ordinary path (FR-8)
+                        None => {}
+                    }
+                }
+                Ok(None) => {}
+            }
+        }
         self.call_default(obj)
     }
 
@@ -313,6 +389,31 @@ impl Encoder {
         }
     }
 
+    /// A numpy object isojson declined (FR-7): the whole object goes to
+    /// `default` when one is given. Without one, the reason's message is
+    /// raised. Either way, when an error results from the decline itself or
+    /// from `default` raising, `reason_note` is attached with `add_note`, so
+    /// the evidence isn't lost. `DepthLimit` gets no note.
+    pub(crate) unsafe fn call_default_declined(
+        &mut self,
+        obj: *mut PyObject,
+        reason: Reason,
+    ) -> bool {
+        if self.default.is_null() {
+            raise_type_error(&reason_message(&reason));
+            add_note(&reason_note(&reason));
+            return false;
+        }
+        match self.invoke_default(obj) {
+            Ok(r) => self.serialize_default_result(r),
+            Err(DefaultErr::Raised) => {
+                add_note(&reason_note(&reason));
+                false
+            }
+            Err(DefaultErr::DepthLimit) => false,
+        }
+    }
+
     /// `obj.utcoffset()` as total µs; `None` when naive (design §1a). The
     /// tzinfo field is read first, so naive objects call no method (D7).
     /// The value is CPython's validated one: `datetime.utcoffset()` itself
@@ -347,23 +448,6 @@ impl Encoder {
         Ok(Some((days * 86_400 + secs) * 1_000_000 + us))
     }
 
-    unsafe fn write_ymd(&mut self, obj: *mut PyObject) {
-        let mut b = [0u8; 10];
-        let n = fmt_ymd(
-            &mut b,
-            PyDateTime_GET_YEAR(obj) as u16,
-            PyDateTime_GET_MONTH(obj) as u8,
-            PyDateTime_GET_DAY(obj) as u8,
-        );
-        small_copy(&mut self.out, &b[..n]);
-    }
-
-    fn write_offset(&mut self, total_us: i64, opts: u32) {
-        let mut b = [0u8; 16];
-        let n = fmt_offset(&mut b, total_us, opts);
-        small_copy(&mut self.out, &b[..n]);
-    }
-
     /// `dt.isoformat()` after `NAIVE_UTC` / `OMIT_MICROSECONDS`, with a zero
     /// offset written `Z` under `UTC_Z` (design §1a, FR-5).
     unsafe fn datetime(&mut self, obj: *mut PyObject) -> bool {
@@ -373,30 +457,28 @@ impl Encoder {
             Ok(None) => None,
             Err(PyErrSet) => return false,
         };
-        self.out.push(b'"');
-        self.write_ymd(obj);
-        self.out.push(b'T');
-        let mut b = [0u8; 15];
-        let n = fmt_hms(
-            &mut b,
-            PyDateTime_DATE_GET_HOUR(obj) as u8,
-            PyDateTime_DATE_GET_MINUTE(obj) as u8,
-            PyDateTime_DATE_GET_SECOND(obj) as u8,
-            PyDateTime_DATE_GET_MICROSECOND(obj) as u32,
-            self.opts,
-        );
-        small_copy(&mut self.out, &b[..n]);
-        if let Some(o) = offset {
-            self.write_offset(o, self.opts);
-        }
-        self.out.push(b'"');
+        let p = Parts {
+            y: PyDateTime_GET_YEAR(obj) as u16,
+            mo: PyDateTime_GET_MONTH(obj) as u8,
+            d: PyDateTime_GET_DAY(obj) as u8,
+            h: PyDateTime_DATE_GET_HOUR(obj) as u8,
+            mi: PyDateTime_DATE_GET_MINUTE(obj) as u8,
+            s: PyDateTime_DATE_GET_SECOND(obj) as u8,
+            us: PyDateTime_DATE_GET_MICROSECOND(obj) as u32,
+        };
+        write_datetime(&mut self.out, &p, offset, self.opts);
         true
     }
 
     /// `d.isoformat()`. No options apply.
     unsafe fn date(&mut self, obj: *mut PyObject) -> bool {
         self.out.push(b'"');
-        self.write_ymd(obj);
+        write_ymd(
+            &mut self.out,
+            PyDateTime_GET_YEAR(obj) as u16,
+            PyDateTime_GET_MONTH(obj) as u8,
+            PyDateTime_GET_DAY(obj) as u8,
+        );
         self.out.push(b'"');
         true
     }
@@ -421,7 +503,7 @@ impl Encoder {
         );
         small_copy(&mut self.out, &b[..n]);
         if let Some(o) = offset {
-            self.write_offset(o, opts);
+            write_offset(&mut self.out, o, opts);
         }
         self.out.push(b'"');
         true

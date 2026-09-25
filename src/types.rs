@@ -25,6 +25,94 @@ pub(crate) struct DtTypes {
     pub(crate) time: *mut PyTypeObject,
 }
 
+/// The numpy group: `ndarray` and the 13 scalar types isojson writes (FR-8),
+/// read from the current interpreter's own numpy. Strong references, so a
+/// cached pointer can't be reused by another object.
+///
+/// A copy must be re-fetched after any call that can run Python: a nested
+/// `dumps` may replace the group (C1's review-enforced invariant).
+#[derive(Clone, Copy)]
+pub(crate) struct NumpyTypes {
+    pub(crate) ndarray: *mut PyTypeObject,
+    pub(crate) float64: *mut PyTypeObject,
+    pub(crate) float32: *mut PyTypeObject,
+    pub(crate) float16: *mut PyTypeObject,
+    pub(crate) int8: *mut PyTypeObject,
+    pub(crate) int16: *mut PyTypeObject,
+    pub(crate) int32: *mut PyTypeObject,
+    pub(crate) int64: *mut PyTypeObject,
+    pub(crate) uint8: *mut PyTypeObject,
+    pub(crate) uint16: *mut PyTypeObject,
+    pub(crate) uint32: *mut PyTypeObject,
+    pub(crate) uint64: *mut PyTypeObject,
+    pub(crate) bool_: *mut PyTypeObject,
+    pub(crate) datetime64: *mut PyTypeObject,
+}
+
+/// The numpy names, in `NumpyTypes::all` order.
+const NUMPY_NAMES: [&CStr; 14] = [
+    c"ndarray",
+    c"float64",
+    c"float32",
+    c"float16",
+    c"int8",
+    c"int16",
+    c"int32",
+    c"int64",
+    c"uint8",
+    c"uint16",
+    c"uint32",
+    c"uint64",
+    c"bool_",
+    c"datetime64",
+];
+
+impl NumpyTypes {
+    fn all(&self) -> [*mut PyTypeObject; 14] {
+        [
+            self.ndarray,
+            self.float64,
+            self.float32,
+            self.float16,
+            self.int8,
+            self.int16,
+            self.int32,
+            self.int64,
+            self.uint8,
+            self.uint16,
+            self.uint32,
+            self.uint64,
+            self.bool_,
+            self.datetime64,
+        ]
+    }
+
+    fn from_all(t: [*mut PyTypeObject; 14]) -> Self {
+        let [ndarray, float64, float32, float16, int8, int16, int32, int64, uint8, uint16, uint32, uint64, bool_, datetime64] =
+            t;
+        NumpyTypes {
+            ndarray,
+            float64,
+            float32,
+            float16,
+            int8,
+            int16,
+            int32,
+            int64,
+            uint8,
+            uint16,
+            uint32,
+            uint64,
+            bool_,
+            datetime64,
+        }
+    }
+
+    fn contains(&self, ty: *mut PyTypeObject) -> bool {
+        self.all().contains(&ty)
+    }
+}
+
 /// The interned names, created in `init`.
 #[repr(C)]
 pub(crate) struct Names {
@@ -56,6 +144,9 @@ pub(crate) struct TypeCache {
     /// Owner of the datetime group: `_datetime.datetime_CAPI`.
     dt_capsule: *mut PyObject,
     dt: DtTypes,
+    /// Owner of the numpy group: the `sys.modules["numpy"]` it was read from.
+    np_module: *mut PyObject,
+    np: NumpyTypes,
     pub(crate) names: Names,
 }
 
@@ -75,6 +166,13 @@ unsafe fn release<T>(slot: &mut *mut T) {
     if !p.is_null() {
         Py_DECREF(p.cast());
     }
+}
+
+unsafe fn release_all(np: &mut NumpyTypes) {
+    for mut t in np.all() {
+        release(&mut t);
+    }
+    *np = NumpyTypes::from_all([ptr::null_mut(); 14]);
 }
 
 impl TypeCache {
@@ -133,8 +231,74 @@ impl TypeCache {
         Ok(Some(dt))
     }
 
+    /// The numpy group if `ty` is one of its types (design §8.1, FR-3).
+    ///
+    /// A hit is trusted. On a miss, the group is re-read only if
+    /// `sys.modules["numpy"]` is no longer the module it was read from; if
+    /// numpy is absent, not a module, or lacks a name, the group is Absent.
+    pub(crate) unsafe fn numpy(&mut self, ty: *mut PyTypeObject) -> R<Option<NumpyTypes>> {
+        if !self.np_module.is_null() && self.np.contains(ty) {
+            return Ok(Some(self.np));
+        }
+        if self.names.numpy.is_null() {
+            return Ok(None);
+        }
+        let Some(module) = get_item(PyImport_GetModuleDict(), self.names.numpy)? else {
+            return Ok(None);
+        };
+        if module == self.np_module {
+            Py_DECREF(module);
+            return Ok(None);
+        }
+        self.clear_numpy();
+        if PyModule_Check(module) == 0 {
+            Py_DECREF(module);
+            return Ok(None);
+        }
+        let d = PyModule_GetDict(module);
+        let mut types = [ptr::null_mut::<PyTypeObject>(); 14];
+        for (slot, name) in types.iter_mut().zip(NUMPY_NAMES) {
+            let key = PyUnicode_InternFromString(name.as_ptr());
+            let v = if key.is_null() {
+                Err(PyErrSet)
+            } else {
+                let v = get_item(d, key);
+                Py_DECREF(key);
+                v
+            };
+            match v {
+                Ok(Some(t)) => *slot = t.cast(),
+                Ok(None) | Err(PyErrSet) => {
+                    for t in types.iter_mut() {
+                        release(t);
+                    }
+                    Py_DECREF(module);
+                    return v.map(|_| None);
+                }
+            }
+        }
+        let np = NumpyTypes::from_all(types);
+        self.np = np;
+        self.np_module = module;
+        Ok(np.contains(ty).then_some(np))
+    }
+
+    unsafe fn clear_numpy(&mut self) {
+        release(&mut self.np_module);
+        release_all(&mut self.np);
+    }
+
     pub(crate) unsafe fn traverse(&self, visit: visitproc, arg: *mut c_void) -> c_int {
-        let held: [*mut PyObject; 11] = [
+        for t in self.np.all() {
+            if !t.is_null() {
+                let r = visit(t.cast(), arg);
+                if r != 0 {
+                    return r;
+                }
+            }
+        }
+        let held: [*mut PyObject; 12] = [
+            self.np_module,
             self.dt_capsule,
             self.dt.datetime.cast(),
             self.dt.date.cast(),
@@ -164,6 +328,7 @@ impl TypeCache {
         release(&mut self.dt.datetime);
         release(&mut self.dt.date);
         release(&mut self.dt.time);
+        self.clear_numpy();
         for (slot, _) in self.names.slots() {
             release(slot);
         }
@@ -184,6 +349,9 @@ mod tests {
             c.clear();
             assert!(matches!(c.datetime(), Ok(None)));
         }
-        assert!(c.dt_capsule.is_null() && c.names.datetime_mod.is_null());
+        unsafe {
+            assert!(matches!(c.numpy(ptr::null_mut()), Ok(None)));
+        }
+        assert!(c.dt_capsule.is_null() && c.names.datetime_mod.is_null() && c.np_module.is_null());
     }
 }

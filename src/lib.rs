@@ -20,6 +20,7 @@ mod decline;
 mod decode;
 mod encode;
 mod float;
+mod numpy;
 mod out;
 mod strfast;
 mod swar;

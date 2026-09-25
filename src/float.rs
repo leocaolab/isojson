@@ -16,7 +16,6 @@ pub(crate) fn write_f64(out: &mut crate::out::Out, v: f64) {
 
 /// float32, and float16 widened with `f16_to_f32`: the shortest digits that
 /// round-trip through f32, with zmij's f32 notation switch (as orjson).
-#[expect(dead_code, reason = "wired into numpy.rs in M2 (isojson#3)")]
 #[inline]
 pub(crate) fn write_f32(out: &mut crate::out::Out, v: f32) {
     if !v.is_finite() {
@@ -43,7 +42,6 @@ fn write_finite<F: zmij::Float>(out: &mut crate::out::Out, v: F) {
 // `cast_signed`/`cast_unsigned` (stable in 1.87), and `f32::from_bits`
 // without `unsafe`. Exact: every f16 is an f32. Proven over all 65,536 inputs
 // by E2E-12.
-#[expect(dead_code, reason = "wired into numpy.rs in M2 (isojson#3)")]
 pub(crate) const fn f16_to_f32(i: u16) -> f32 {
     if i & 0x7FFFu16 == 0 {
         return f32::from_bits((i as u32) << 16);
