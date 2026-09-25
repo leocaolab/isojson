@@ -20,7 +20,7 @@ import isojson
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
-README = (ROOT / "README.md").read_text()
+README = (ROOT / "README.md").read_text(encoding="utf-8")
 
 
 def code_only(text: str) -> str:
@@ -30,7 +30,7 @@ def code_only(text: str) -> str:
 
 
 def sources():
-    return {p.relative_to(SRC).as_posix(): code_only(p.read_text()) for p in sorted(SRC.rglob("*.rs"))}
+    return {p.relative_to(SRC).as_posix(): code_only(p.read_text(encoding="utf-8")) for p in sorted(SRC.rglob("*.rs"))}
 
 
 # ---- (1) static / thread_local! allow-lists ----------------------------------

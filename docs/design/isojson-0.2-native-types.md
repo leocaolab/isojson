@@ -114,7 +114,7 @@ both halves (E2E-4). README "Differences from orjson" mirrors this table; E2E-9 
 | DV-1 | UTC offset with non-zero seconds or microseconds: `+05:59:30`, `+05:00:00.000001`, `-00:00:01`, `-23:59:59.999999`; zoneinfo before standard time (`America/New_York` 1850 = `-04:56:02`) | drops them, rounding to the minute without carrying into hours: `+05:60`, `+05:00`, `-00:00` (RFC 3339 "offset unknown"), `+00:00` (sign lost), `-04:56` | as `isoformat()`: `+05:59:30`, `+05:00:00.000001`, `-00:00:01`, `-23:59:59.999999`, `-04:56:02` (§1a) |
 | DV-2 | (merged into DV-1 in round 8; id kept) | | |
 | DV-3 | pytz datetime after arithmetic, not normalized (`localize(2026-03-07 12:00 EST) + 2 days`) | `…T12:00:00-04:00`: the normalized offset on the un-normalized wall time, which is a different instant | `…T12:00:00-05:00` (`dt.utcoffset()`) |
-| DV-4a | aware datetime, `utcoffset()` returns `None` | appends `+00:00`, an invented offset | no offset (naive to Python) |
+| DV-4a | aware datetime, `utcoffset()` returns `None` | appends an invented offset: it reads the `None` as a timedelta, so `+00:00` (`Z` with `UTC_Z` on 3.14) on macOS and x86_64 Linux, garbage such as `+18:12` on aarch64 Linux (measured in M1 CI) | no offset (naive to Python) |
 | DV-4b | `utcoffset()` raises (datetime) or is invalid (time) | datetime: dies (SIGSEGV) | `TypeError("<datetime\|time>.utcoffset() raised <Exc>: <msg>")`, with the exception as `__cause__` |
 | DV-5 | `datetime64` NaT, unit `ns` | `"1677-09-21T00:12:43.145224"`, an invented date | `null` |
 | DV-6 | `datetime64` NaT, units `W D h m` | `"1970-01-01T00:00:00"` (the multiply wraps) | `null` |

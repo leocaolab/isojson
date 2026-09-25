@@ -11,6 +11,7 @@ Datetime rows (DV-1, 3, 4a, 4b, 12, 15, 17) here; the numpy rows (DV-5…11, 13,
 """
 
 import datetime as dt
+import re
 import subprocess
 import sys
 import textwrap
@@ -99,9 +100,10 @@ def test_dv3_pytz_unnormalized():
 def test_dv4a_none_offset_is_naive(opts):
     x = dt.datetime(2026, 1, 1, 1, 2, 3, 4, tzinfo=Fixed(None))
     o = orjson.dumps(x, option=opts)
-    # (a): an invented zero offset (spelled `Z` under UTC_Z on 3.14, `+00:00`
-    # on 3.12/3.13 — orjson's own version-dependent path)
-    assert o.endswith(b'+00:00"') or (opts & UTC_Z and o.endswith(b'Z"')), o
+    # (a): an invented offset. orjson reads the `None` as a timedelta, so the
+    # value depends on the platform: `+00:00` / `Z` on macOS and x86_64
+    # Linux, garbage such as `+18:12` on aarch64 Linux (measured in CI).
+    assert re.search(rb'([+-]\d\d:\d\d|Z)"$', o), o
     ref = expected_text(x, opts)
     assert not ref.endswith(b'Z"') and b"+" not in ref  # (b): naive to Python
     assert isojson.dumps(x, option=opts) == ref  # (c)
