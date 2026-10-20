@@ -218,7 +218,7 @@ isojson's own tests cover the case.
 | `uuid.UUID`, `enum.Enum`, dataclasses natively | ❌ → `default=` | ✅ | ❌ |
 | Non-`str` dict keys (`OPT_NON_STR_KEYS`) | ❌ raises | ✅ | ~ (coerced) |
 | `orjson.Fragment` | ❌ | ✅ | ❌ |
-| Integers beyond 64 bits in `dumps` | ❌ (like orjson) | ❌ | ✅ |
+| Integers beyond 64 bits in `dumps` | ✅ (as `json.dumps`) | ❌ `TypeError` | ✅ |
 | NaN / ±Infinity in `dumps` | `null` (like orjson) | `null` | `NaN` / `Infinity` |
 | Python versions | CPython 3.14 | CPython 3.10+ | all |
 
@@ -254,6 +254,16 @@ section). Each row has a regression test that proves both halves.
 | DV-15 | `utcoffset()` returns a non-timedelta or ≥ 24 h | an invented or garbage offset | `TypeError`, as `dt.utcoffset()` raises |
 | DV-16 | `datetime64` in `ps`, `fs`, `as` | `TypeError`, even with `default` | floored to µs |
 | DV-17 | a `time` whose microsecond has five digits (`time(0, 0, 1, 75652)`) | drops the leading zero: `"00:00:01.75652"` | `"00:00:01.075652"` |
+
+### Integers beyond 64 bits
+
+orjson raises `TypeError: Integer exceeds 64-bit range` for an `int` outside
+`i64::MIN` … `u64::MAX`. isojson writes it in full, as `json.dumps` does:
+`isojson.dumps({"n": 2**64})` is `b'{"n":18446744073709551616}'`. CPython
+formats the digits under the calling interpreter's
+`sys.set_int_max_str_digits` limit (4300 by default), so a longer integer
+raises the same `ValueError` as `json.dumps`. `OPT_STRICT_INTEGER` still
+raises for anything outside 53 bits.
 
 ### Declined numpy objects
 

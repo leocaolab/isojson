@@ -628,12 +628,33 @@ impl Encoder {
             }
             PyErr_Clear();
         }
+        self.int_outside_64_bits(obj)
+    }
+
+    /// An integer outside `i64::MIN..=u64::MAX`, written in full as `json.dumps` writes it.
+    /// CPython formats the digits, under the interpreter's `sys.set_int_max_str_digits` limit,
+    /// so a longer one raises `json.dumps`' `ValueError`.
+    #[cold]
+    #[inline(never)]
+    unsafe fn int_outside_64_bits(&mut self, obj: *mut PyObject) -> bool {
         if self.opts & OPT_STRICT_INTEGER != 0 {
             raise_type_error("Integer exceeds 53-bit range");
-        } else {
-            raise_type_error("Integer exceeds 64-bit range");
+            return false;
         }
-        false
+        // Not `str(obj)`: an `int` subclass's `__str__` / `__repr__` is not the value.
+        let text = PyNumber_ToBase(obj, 10);
+        if text.is_null() {
+            return false;
+        }
+        let mut n: Py_ssize_t = 0;
+        let p = PyUnicode_AsUTF8AndSize(text, &mut n);
+        let ok = !p.is_null();
+        if ok {
+            self.out
+                .extend_from_slice(core::slice::from_raw_parts(p.cast::<u8>(), n as usize));
+        }
+        Py_DECREF(text);
+        ok
     }
 
     unsafe fn list(&mut self, obj: *mut PyObject) -> bool {
