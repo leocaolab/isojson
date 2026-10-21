@@ -119,3 +119,54 @@ def test_e2e10b_default_imports_datetime():
     )
     assert r.returncode == 0, r.stderr[-3000:]
     assert r.stdout.strip() == '["2026-01-01T12:30:00",1]'
+
+
+# A `__del__` on cyclic garbage calls `loads` on the same thread. The garbage
+# is made while automatic collection can't start, then the threshold drops to
+# 1, so the first container `loads` allocates schedules a collection; CPython
+# runs it at the next point where Python code runs.
+LOADS_FROM_DEL = """
+import sys
+inner = []
+
+class Reenter:
+    def __del__(self):
+        inner.append(isojson.loads(b'{"inner": [1, 2]}'))
+
+gc.collect()
+gc.set_threshold(100000)
+a = Reenter()
+a.cycle = a
+del a
+gc.set_threshold(1)
+try:
+    outer = isojson.loads(DOC)
+except isojson.JSONDecodeError as e:
+    outer = ["JSONDecodeError", e.pos]
+gc.set_threshold(700)
+gc.collect()
+print(json.dumps({"inner": inner, "outer": outer}))
+"""
+
+
+def test_loads_from_del_while_raising_decode_error():
+    """`JSONDecodeError.__init__` is Python code, so the collection runs
+    there, inside the outer `loads`."""
+    out = run_child("DOC = b'{\"k\": [1, 2,'\n" + LOADS_FROM_DEL)
+    assert json.loads(out) == {
+        "inner": [{"inner": [1, 2]}],
+        "outer": ["JSONDecodeError", 11],
+    }
+
+
+def test_loads_from_del_with_collection_pending_during_build():
+    """Building the result runs no Python code, so the collection scheduled
+    while thousands of containers and cached keys are made waits until
+    `loads` has returned."""
+    out = run_child(
+        "DOC = b'[' + b','.join([b'{\"k\": [1, {\"x\": [2, 3]}]}'] * 20000) + b']'\n"
+        + LOADS_FROM_DEL
+    )
+    got = json.loads(out)
+    assert got["inner"] == [{"inner": [1, 2]}]
+    assert got["outer"] == [{"k": [1, {"x": [2, 3]}]}] * 20000

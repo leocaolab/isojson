@@ -352,26 +352,27 @@ unsafe fn run(module: *mut PyObject, input: &[u8], doc: *mut PyObject) -> *mut P
         return ptr::null_mut();
     }
     let keys = (*state(module)).key_cache;
-    SCRATCH.with(|scratch| {
+    // The scratch is borrowed only while no Python code can run: building
+    // runs none, but `JSONDecodeError.__init__` does, and a `__del__` run
+    // there by the GC may call `loads` again on this thread.
+    let parsed = SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         let (buf, buffers, kept) = &mut *scratch;
         buf.clear();
         buf.extend_from_slice(input);
         let mut tape = core::mem::replace(kept, Tape(Vec::new())).reset();
-        let out = match simd_json::fill_tape(buf, buffers, &mut tape) {
-            Err(e) => {
-                let msg = describe(e.error());
-                raise_decode_error(module, &msg, input, doc, e.index());
-                ptr::null_mut()
-            }
-            Ok(()) => match build(&tape.0, keys) {
-                Ok(o) => o,
-                Err(PendingPyErr) => ptr::null_mut(),
-            },
-        };
+        let parsed = simd_json::fill_tape(buf, buffers, &mut tape).map(|()| build(&tape.0, keys));
         *kept = tape.reset();
-        out
-    })
+        parsed
+    });
+    match parsed {
+        Ok(Ok(o)) => o,
+        Ok(Err(PendingPyErr)) => ptr::null_mut(),
+        Err(e) => {
+            raise_decode_error(module, &describe(e.error()), input, doc, e.index());
+            ptr::null_mut()
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn loads(module: *mut PyObject, obj: *mut PyObject) -> *mut PyObject {
