@@ -501,7 +501,7 @@ cargo test --lib              # the pure Rust core
     sub-interpreters writing datetimes (`tests/test_concurrency_dt.py`);
   - no process-global Python state: every `static` reviewed, banned symbols,
     cached types traversed by the GC (`tests/test_no_global_pyobject.py`).
-- **Per-worker numpy in Pyronova**: Pyronova's
+- **Per-worker numpy in mipyre**: [mipyre](https://github.com/leocaolab/mipyre)'s
   `tests/test_isojson_numpy_workers.py` runs 4 workers, each with its own
   numpy copy, against orjson's bytes.
 
