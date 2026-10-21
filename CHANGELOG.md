@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `dumps` writes an `int` outside `i64::MIN` … `u64::MAX` in full, as
+  `json.dumps` does, instead of raising `TypeError: Integer exceeds 64-bit
+  range` (orjson still raises). Past the interpreter's
+  `sys.set_int_max_str_digits` limit it raises `json.dumps`' `ValueError`.
+  `OPT_STRICT_INTEGER` is unchanged. Integers inside 64 bits are written as
+  before, through the same code.
+
 ## 0.2.0
 
 Native `datetime` / `date` / `time` and numpy, still safe in own-GIL
