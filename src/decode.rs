@@ -118,16 +118,62 @@ unsafe fn new_ref(p: *mut PyObject) -> PyResult<*mut PyObject> {
     }
 }
 
-/// Builds a `str` from bytes that simd-json has already validated as UTF-8.
 #[inline]
-unsafe fn make_str(b: &[u8]) -> PyResult<*mut PyObject> {
-    if swar::is_ascii(b) {
-        return new_ascii(b);
+unsafe fn make_str(s: &str) -> PyResult<*mut PyObject> {
+    if swar::is_ascii(s.as_bytes()) {
+        return new_ascii(s.as_bytes());
     }
-    new_ref(PyUnicode_FromStringAndSize(
-        b.as_ptr().cast(),
-        b.len() as Py_ssize_t,
-    ))
+    new_ref(new_non_ascii(s))
+}
+
+/// Builds a `str` of the kind CPython itself would pick, without decoding the
+/// UTF-8 a second time as `PyUnicode_FromStringAndSize` does: the highest lead
+/// byte decides the kind (orjson's rule), since it bounds the highest code point.
+/// Returns null with the Python error set on failure.
+///
+/// It is `#[cold]` and returns a bare pointer, as the C call it replaces did, to
+/// keep the ASCII path's registers as they were: otherwise ASCII-only documents
+/// ran about 1% more instructions per `loads`.
+#[cold]
+#[inline(never)]
+unsafe fn new_non_ascii(s: &str) -> *mut PyObject {
+    let mut chars = 0usize;
+    let mut highest = 0u8;
+    for &b in s.as_bytes() {
+        chars += usize::from(b & 0xC0 != 0x80);
+        highest = highest.max(b);
+    }
+    // a one-character Latin-1 string is CPython's shared singleton, not a new object
+    if chars == 1 && highest < 0xC4 {
+        if let Some(c) = s.chars().next() {
+            return PyUnicode_FromOrdinal(c as core::ffi::c_int);
+        }
+    }
+    match highest {
+        0xF0.. => new_of_kind(s, chars, 0x10_FFFF, |c| c as u32),
+        0xC4.. => new_of_kind(s, chars, 0xFFFF, |c| c as u16),
+        _ => new_of_kind(s, chars, 0xFF, |c| c as u8),
+    }
+}
+
+/// `chars` must be the number of code points in `s`, and `maxchar` at least
+/// the highest of them and narrow enough for `T`.
+#[inline(always)]
+unsafe fn new_of_kind<T>(
+    s: &str,
+    chars: usize,
+    maxchar: Py_UCS4,
+    narrow: impl Fn(char) -> T,
+) -> *mut PyObject {
+    let o = PyUnicode_New(chars as Py_ssize_t, maxchar);
+    if o.is_null() {
+        return o;
+    }
+    let dst = PyUnicode_DATA(o).cast::<T>();
+    for (i, c) in s.chars().enumerate() {
+        dst.add(i).write(narrow(c));
+    }
+    o
 }
 
 /// A list or dict being filled; `obj` owns the items inserted so far.
@@ -170,9 +216,9 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> PyResult<*mut PyObje
                     unreachable!("simd-json object keys are strings")
                 };
                 i += 1;
-                let k = k.as_bytes();
-                top.key = if k.len() <= CACHE_MAX_KEY && !keys.is_null() && swar::is_ascii(k) {
-                    (*keys).get(k)?
+                let kb = k.as_bytes();
+                top.key = if kb.len() <= CACHE_MAX_KEY && !keys.is_null() && swar::is_ascii(kb) {
+                    (*keys).get(kb)?
                 } else {
                     make_str(k)?
                 };
@@ -182,7 +228,7 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> PyResult<*mut PyObje
         let node = *nodes.get_unchecked(i);
         i += 1;
         let mut val = match node {
-            Node::String(s) => make_str(s.as_bytes())?,
+            Node::String(s) => make_str(s)?,
             Node::Static(StaticNode::Null) => {
                 Py_INCREF(Py_None());
                 Py_None()
