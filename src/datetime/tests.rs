@@ -121,45 +121,45 @@ fn civil_from_days_exhaustive() {
 
 // ---- parse_dt64 ------------------------------------------------------------
 
-fn unit(base: Unit, mult: i64) -> Dt64Unit {
+fn unit(base: TimeUnit, mult: i64) -> Dt64Unit {
     Dt64Unit { base, mult }
 }
 
 #[test]
 fn parse_dt64_valid() {
-    let cases: &[(&[u8], Unit)] = &[
-        (b"<M8[Y]", Unit::Year),
-        (b"<M8[M]", Unit::Month),
-        (b"<M8[W]", Unit::Week),
-        (b"<M8[D]", Unit::Day),
-        (b"<M8[h]", Unit::Hour),
-        (b"<M8[m]", Unit::Minute),
-        (b"<M8[s]", Unit::Second),
-        (b"<M8[ms]", Unit::Milli),
-        (b"<M8[us]", Unit::Micro),
-        (b"<M8[ns]", Unit::Nano),
-        (b"<M8[ps]", Unit::Pico),
-        (b"<M8[fs]", Unit::Femto),
-        (b"<M8[as]", Unit::Atto),
+    let cases: &[(&[u8], TimeUnit)] = &[
+        (b"<M8[Y]", TimeUnit::Year),
+        (b"<M8[M]", TimeUnit::Month),
+        (b"<M8[W]", TimeUnit::Week),
+        (b"<M8[D]", TimeUnit::Day),
+        (b"<M8[h]", TimeUnit::Hour),
+        (b"<M8[m]", TimeUnit::Minute),
+        (b"<M8[s]", TimeUnit::Second),
+        (b"<M8[ms]", TimeUnit::Milli),
+        (b"<M8[us]", TimeUnit::Micro),
+        (b"<M8[ns]", TimeUnit::Nano),
+        (b"<M8[ps]", TimeUnit::Pico),
+        (b"<M8[fs]", TimeUnit::Femto),
+        (b"<M8[as]", TimeUnit::Atto),
     ];
     for &(s, base) in cases {
         assert_eq!(parse_dt64(s), Some(unit(base, 1)), "{s:?}");
     }
-    assert_eq!(parse_dt64(b"<M8"), Some(unit(Unit::Generic, 1)));
-    assert_eq!(parse_dt64(b">M8[ns]"), Some(unit(Unit::Nano, 1)));
-    assert_eq!(parse_dt64(b"=M8[D]"), Some(unit(Unit::Day, 1)));
-    assert_eq!(parse_dt64(b"|M8[s]"), Some(unit(Unit::Second, 1)));
+    assert_eq!(parse_dt64(b"<M8"), Some(unit(TimeUnit::Generic, 1)));
+    assert_eq!(parse_dt64(b">M8[ns]"), Some(unit(TimeUnit::Nano, 1)));
+    assert_eq!(parse_dt64(b"=M8[D]"), Some(unit(TimeUnit::Day, 1)));
+    assert_eq!(parse_dt64(b"|M8[s]"), Some(unit(TimeUnit::Second, 1)));
 }
 
 #[test]
 fn parse_dt64_multiplied() {
-    assert_eq!(parse_dt64(b"<M8[10ms]"), Some(unit(Unit::Milli, 10)));
-    assert_eq!(parse_dt64(b"<M8[2D]"), Some(unit(Unit::Day, 2)));
-    assert_eq!(parse_dt64(b"<M8[1ns]"), Some(unit(Unit::Nano, 1)));
-    assert_eq!(parse_dt64(b"<M8[1000Y]"), Some(unit(Unit::Year, 1000)));
+    assert_eq!(parse_dt64(b"<M8[10ms]"), Some(unit(TimeUnit::Milli, 10)));
+    assert_eq!(parse_dt64(b"<M8[2D]"), Some(unit(TimeUnit::Day, 2)));
+    assert_eq!(parse_dt64(b"<M8[1ns]"), Some(unit(TimeUnit::Nano, 1)));
+    assert_eq!(parse_dt64(b"<M8[1000Y]"), Some(unit(TimeUnit::Year, 1000)));
     assert_eq!(
         parse_dt64(b"<M8[2147483647as]"),
-        Some(unit(Unit::Atto, 2_147_483_647))
+        Some(unit(TimeUnit::Atto, 2_147_483_647))
     );
 }
 
@@ -189,8 +189,8 @@ fn parse_dt64_unparseable() {
 
 // ---- dt64_to_parts: design boundaries --------------------------------------
 
-fn parts(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> Parts {
-    Parts {
+fn parts(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> DateTimeParts {
+    DateTimeParts {
         y,
         mo,
         d,
@@ -201,36 +201,36 @@ fn parts(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> Parts {
     }
 }
 
-fn ok(v: i64, base: Unit, mult: i64) -> Parts {
+fn ok(v: i64, base: TimeUnit, mult: i64) -> DateTimeParts {
     match dt64_to_parts(v, unit(base, mult)) {
         Ok(Some(p)) => p,
         other => panic!("{v} {base:?}×{mult}: {other:?}"),
     }
 }
 
-fn unrepresentable(v: i64, base: Unit, mult: i64) {
+fn unrepresentable(v: i64, base: TimeUnit, mult: i64) {
     assert_eq!(
         dt64_to_parts(v, unit(base, mult)),
-        Err(Dt64Err::Unrepresentable),
+        Err(Dt64Error::Unrepresentable),
         "{v} {base:?}×{mult}"
     );
 }
 
-const ALL_UNITS: [Unit; 14] = [
-    Unit::Year,
-    Unit::Month,
-    Unit::Week,
-    Unit::Day,
-    Unit::Hour,
-    Unit::Minute,
-    Unit::Second,
-    Unit::Milli,
-    Unit::Micro,
-    Unit::Nano,
-    Unit::Pico,
-    Unit::Femto,
-    Unit::Atto,
-    Unit::Generic,
+const ALL_UNITS: [TimeUnit; 14] = [
+    TimeUnit::Year,
+    TimeUnit::Month,
+    TimeUnit::Week,
+    TimeUnit::Day,
+    TimeUnit::Hour,
+    TimeUnit::Minute,
+    TimeUnit::Second,
+    TimeUnit::Milli,
+    TimeUnit::Micro,
+    TimeUnit::Nano,
+    TimeUnit::Pico,
+    TimeUnit::Femto,
+    TimeUnit::Atto,
+    TimeUnit::Generic,
 ];
 
 #[test]
@@ -248,104 +248,113 @@ fn generic_value_is_declined() {
     // DV-13 / FR-7 (e)
     for v in [0, 5, -1, i64::MAX, i64::MIN + 1] {
         assert_eq!(
-            dt64_to_parts(v, unit(Unit::Generic, 1)),
-            Err(Dt64Err::GenericValue)
+            dt64_to_parts(v, unit(TimeUnit::Generic, 1)),
+            Err(Dt64Error::GenericUnit)
         );
     }
 }
 
 #[test]
 fn dv8_multiplied_units() {
-    assert_eq!(ok(1, Unit::Milli, 10), parts(1970, 1, 1, 0, 0, 0, 10_000));
-    assert_eq!(ok(1, Unit::Day, 2), parts(1970, 1, 3, 0, 0, 0, 0));
-    assert_eq!(ok(-1, Unit::Day, 2), parts(1969, 12, 30, 0, 0, 0, 0));
-    assert_eq!(ok(3, Unit::Minute, 7), parts(1970, 1, 1, 0, 21, 0, 0));
+    assert_eq!(
+        ok(1, TimeUnit::Milli, 10),
+        parts(1970, 1, 1, 0, 0, 0, 10_000)
+    );
+    assert_eq!(ok(1, TimeUnit::Day, 2), parts(1970, 1, 3, 0, 0, 0, 0));
+    assert_eq!(ok(-1, TimeUnit::Day, 2), parts(1969, 12, 30, 0, 0, 0, 0));
+    assert_eq!(ok(3, TimeUnit::Minute, 7), parts(1970, 1, 1, 0, 21, 0, 0));
 }
 
 #[test]
 fn dv9_months_floor() {
-    assert_eq!(ok(-1, Unit::Month, 1), parts(1969, 12, 1, 0, 0, 0, 0));
-    assert_eq!(ok(-2, Unit::Month, 1), parts(1969, 11, 1, 0, 0, 0, 0));
-    assert_eq!(ok(-12, Unit::Month, 1), parts(1969, 1, 1, 0, 0, 0, 0));
-    assert_eq!(ok(-13, Unit::Month, 1), parts(1968, 12, 1, 0, 0, 0, 0));
-    assert_eq!(ok(11, Unit::Month, 1), parts(1970, 12, 1, 0, 0, 0, 0));
-    assert_eq!(ok(-1, Unit::Month, 3), parts(1969, 10, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-1, TimeUnit::Month, 1), parts(1969, 12, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-2, TimeUnit::Month, 1), parts(1969, 11, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-12, TimeUnit::Month, 1), parts(1969, 1, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-13, TimeUnit::Month, 1), parts(1968, 12, 1, 0, 0, 0, 0));
+    assert_eq!(ok(11, TimeUnit::Month, 1), parts(1970, 12, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-1, TimeUnit::Month, 3), parts(1969, 10, 1, 0, 0, 0, 0));
     // 0000-01 and 9999-12 are the ends
-    assert_eq!(ok(-1970 * 12, Unit::Month, 1), parts(0, 1, 1, 0, 0, 0, 0));
-    unrepresentable(-1970 * 12 - 1, Unit::Month, 1);
     assert_eq!(
-        ok(8030 * 12 - 1, Unit::Month, 1),
+        ok(-1970 * 12, TimeUnit::Month, 1),
+        parts(0, 1, 1, 0, 0, 0, 0)
+    );
+    unrepresentable(-1970 * 12 - 1, TimeUnit::Month, 1);
+    assert_eq!(
+        ok(8030 * 12 - 1, TimeUnit::Month, 1),
         parts(9999, 12, 1, 0, 0, 0, 0)
     );
-    unrepresentable(8030 * 12, Unit::Month, 1);
-    unrepresentable(i64::MAX, Unit::Month, 1);
+    unrepresentable(8030 * 12, TimeUnit::Month, 1);
+    unrepresentable(i64::MAX, TimeUnit::Month, 1);
 }
 
 #[test]
 fn years_range() {
-    assert_eq!(ok(0, Unit::Year, 1), parts(1970, 1, 1, 0, 0, 0, 0));
-    assert_eq!(ok(-1970, Unit::Year, 1), parts(0, 1, 1, 0, 0, 0, 0));
-    unrepresentable(-1971, Unit::Year, 1);
-    assert_eq!(ok(8029, Unit::Year, 1), parts(9999, 1, 1, 0, 0, 0, 0));
-    unrepresentable(8030, Unit::Year, 1);
+    assert_eq!(ok(0, TimeUnit::Year, 1), parts(1970, 1, 1, 0, 0, 0, 0));
+    assert_eq!(ok(-1970, TimeUnit::Year, 1), parts(0, 1, 1, 0, 0, 0, 0));
+    unrepresentable(-1971, TimeUnit::Year, 1);
+    assert_eq!(ok(8029, TimeUnit::Year, 1), parts(9999, 1, 1, 0, 0, 0, 0));
+    unrepresentable(8030, TimeUnit::Year, 1);
     // numpy's astype wraps this to 1969 (§1a); the value is out of range
-    unrepresentable(i64::MAX, Unit::Year, 1);
-    unrepresentable(i64::MIN + 1, Unit::Year, 1);
+    unrepresentable(i64::MAX, TimeUnit::Year, 1);
+    unrepresentable(i64::MIN + 1, TimeUnit::Year, 1);
 }
 
 #[test]
 fn dv10_last_day() {
-    assert_eq!(ok(MAX_DAYS, Unit::Day, 1), parts(9999, 12, 31, 0, 0, 0, 0));
-    unrepresentable(MAX_DAYS + 1, Unit::Day, 1);
-    assert_eq!(ok(MIN_DAYS, Unit::Day, 1), parts(0, 1, 1, 0, 0, 0, 0));
-    unrepresentable(MIN_DAYS - 1, Unit::Day, 1);
+    assert_eq!(
+        ok(MAX_DAYS, TimeUnit::Day, 1),
+        parts(9999, 12, 31, 0, 0, 0, 0)
+    );
+    unrepresentable(MAX_DAYS + 1, TimeUnit::Day, 1);
+    assert_eq!(ok(MIN_DAYS, TimeUnit::Day, 1), parts(0, 1, 1, 0, 0, 0, 0));
+    unrepresentable(MIN_DAYS - 1, TimeUnit::Day, 1);
     let last_us = (MAX_DAYS + 1) * 86_400_000_000 - 1;
     assert_eq!(
-        ok(last_us, Unit::Micro, 1),
+        ok(last_us, TimeUnit::Micro, 1),
         parts(9999, 12, 31, 23, 59, 59, 999_999)
     );
-    unrepresentable(last_us + 1, Unit::Micro, 1);
+    unrepresentable(last_us + 1, TimeUnit::Micro, 1);
     let first_s = MIN_DAYS * 86_400;
-    assert_eq!(ok(first_s, Unit::Second, 1), parts(0, 1, 1, 0, 0, 0, 0));
-    unrepresentable(first_s - 1, Unit::Second, 1);
+    assert_eq!(ok(first_s, TimeUnit::Second, 1), parts(0, 1, 1, 0, 0, 0, 0));
+    unrepresentable(first_s - 1, TimeUnit::Second, 1);
 }
 
 #[test]
 fn dv11_overflowing_minutes() {
-    unrepresentable(307_445_734_561_825_861, Unit::Minute, 1);
-    unrepresentable(i64::MAX, Unit::Week, 1);
-    unrepresentable(i64::MIN + 1, Unit::Day, 1);
-    unrepresentable(i64::MAX, Unit::Hour, 1000);
+    unrepresentable(307_445_734_561_825_861, TimeUnit::Minute, 1);
+    unrepresentable(i64::MAX, TimeUnit::Week, 1);
+    unrepresentable(i64::MIN + 1, TimeUnit::Day, 1);
+    unrepresentable(i64::MAX, TimeUnit::Hour, 1000);
 }
 
 #[test]
 fn dv16_sub_microsecond_floors() {
-    assert_eq!(ok(5, Unit::Pico, 1), parts(1970, 1, 1, 0, 0, 0, 0));
+    assert_eq!(ok(5, TimeUnit::Pico, 1), parts(1970, 1, 1, 0, 0, 0, 0));
     assert_eq!(
-        ok(-1, Unit::Pico, 1),
+        ok(-1, TimeUnit::Pico, 1),
         parts(1969, 12, 31, 23, 59, 59, 999_999)
     );
     assert_eq!(
-        ok(i64::MAX, Unit::Pico, 1),
+        ok(i64::MAX, TimeUnit::Pico, 1),
         parts(1970, 4, 17, 18, 2, 52, 36_854)
     );
     assert_eq!(
-        ok(-1, Unit::Nano, 1),
+        ok(-1, TimeUnit::Nano, 1),
         parts(1969, 12, 31, 23, 59, 59, 999_999)
     );
-    assert_eq!(ok(1_999, Unit::Nano, 1), parts(1970, 1, 1, 0, 0, 0, 1));
+    assert_eq!(ok(1_999, TimeUnit::Nano, 1), parts(1970, 1, 1, 0, 0, 0, 1));
     assert_eq!(
-        ok(-1, Unit::Atto, 1),
+        ok(-1, TimeUnit::Atto, 1),
         parts(1969, 12, 31, 23, 59, 59, 999_999)
     );
     // M8[ns] i64 MIN+1: numpy's astype overflows here (§1a); the meaning is defined
     assert_eq!(
-        ok(i64::MIN + 1, Unit::Nano, 1),
+        ok(i64::MIN + 1, TimeUnit::Nano, 1),
         parts(1677, 9, 21, 0, 12, 43, 145_224)
     );
     // M8[10ns] 1e18: numpy's datetime_as_string overflows (R10-B1)
     assert_eq!(
-        ok(1_000_000_000_000_000_000, Unit::Nano, 10),
+        ok(1_000_000_000_000_000_000, TimeUnit::Nano, 10),
         parts(2286, 11, 20, 17, 46, 40, 0)
     );
 }
@@ -353,20 +362,20 @@ fn dv16_sub_microsecond_floors() {
 // ---- dt64_to_parts: the exact-integer model --------------------------------
 
 /// µs per `n` units as a ratio `num / den`.
-fn ratio(base: Unit) -> (i128, i128) {
+fn ratio(base: TimeUnit) -> (i128, i128) {
     match base {
-        Unit::Week => (604_800_000_000, 1),
-        Unit::Day => (86_400_000_000, 1),
-        Unit::Hour => (3_600_000_000, 1),
-        Unit::Minute => (60_000_000, 1),
-        Unit::Second => (1_000_000, 1),
-        Unit::Milli => (1_000, 1),
-        Unit::Micro => (1, 1),
-        Unit::Nano => (1, 1_000),
-        Unit::Pico => (1, 1_000_000),
-        Unit::Femto => (1, 1_000_000_000),
-        Unit::Atto => (1, 1_000_000_000_000),
-        Unit::Year | Unit::Month | Unit::Generic => unreachable!(),
+        TimeUnit::Week => (604_800_000_000, 1),
+        TimeUnit::Day => (86_400_000_000, 1),
+        TimeUnit::Hour => (3_600_000_000, 1),
+        TimeUnit::Minute => (60_000_000, 1),
+        TimeUnit::Second => (1_000_000, 1),
+        TimeUnit::Milli => (1_000, 1),
+        TimeUnit::Micro => (1, 1),
+        TimeUnit::Nano => (1, 1_000),
+        TimeUnit::Pico => (1, 1_000_000),
+        TimeUnit::Femto => (1, 1_000_000_000),
+        TimeUnit::Atto => (1, 1_000_000_000_000),
+        TimeUnit::Year | TimeUnit::Month | TimeUnit::Generic => unreachable!(),
     }
 }
 
@@ -426,12 +435,12 @@ impl Model {
         }
     }
 
-    fn eval(&self, v: i64, u: Dt64Unit) -> Result<Option<Parts>, Dt64Err> {
+    fn eval(&self, v: i64, u: Dt64Unit) -> Result<Option<DateTimeParts>, Dt64Error> {
         if v == i64::MIN {
             return Ok(None);
         }
         let n = v as i128 * u.mult as i128;
-        let p = |y: i128, mo: i128, d: i128, rem: i128| Parts {
+        let p = |y: i128, mo: i128, d: i128, rem: i128| DateTimeParts {
             y: y as u16,
             mo: mo as u8,
             d: d as u8,
@@ -441,31 +450,31 @@ impl Model {
             us: (rem % 1_000_000) as u32,
         };
         match u.base {
-            Unit::Generic => Err(Dt64Err::GenericValue),
-            Unit::Year => {
+            TimeUnit::Generic => Err(Dt64Error::GenericUnit),
+            TimeUnit::Year => {
                 let y = 1970 + n;
                 if (0..10_000).contains(&y) {
                     Ok(Some(p(y, 1, 1, 0)))
                 } else {
-                    Err(Dt64Err::Unrepresentable)
+                    Err(Dt64Error::Unrepresentable)
                 }
             }
-            Unit::Month => {
+            TimeUnit::Month => {
                 let t = 1970 * 12 + n; // months since 0000-01
                 if (0..10_000 * 12).contains(&t) {
                     Ok(Some(p(t / 12, t % 12 + 1, 1, 0)))
                 } else {
-                    Err(Dt64Err::Unrepresentable)
+                    Err(Dt64Error::Unrepresentable)
                 }
             }
             base => {
                 let (num, den) = ratio(base);
                 let Some(scaled) = n.checked_mul(num) else {
-                    return Err(Dt64Err::Unrepresentable);
+                    return Err(Dt64Error::Unrepresentable);
                 };
                 let us = scaled.div_euclid(den);
                 if us < self.lo_us || us >= self.hi_us {
-                    return Err(Dt64Err::Unrepresentable);
+                    return Err(Dt64Error::Unrepresentable);
                 }
                 let (y, mo, d) = walk_date(us.div_euclid(US_PER_DAY));
                 Ok(Some(p(y, mo, d, us.rem_euclid(US_PER_DAY))))
@@ -476,9 +485,9 @@ impl Model {
     /// `v` values whose result crosses 0000-01-01 or 10000-01-01, ±2.
     fn crossings(&self, u: Dt64Unit) -> Vec<i64> {
         let targets: [i128; 2] = match u.base {
-            Unit::Year => [-1970, 8030],
-            Unit::Month => [-1970 * 12, 8030 * 12],
-            Unit::Generic => return vec![],
+            TimeUnit::Year => [-1970, 8030],
+            TimeUnit::Month => [-1970 * 12, 8030 * 12],
+            TimeUnit::Generic => return vec![],
             base => {
                 let (num, den) = ratio(base);
                 [self.lo_us * den / num, self.hi_us * den / num]

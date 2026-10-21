@@ -11,6 +11,10 @@
 //!
 //! Multi-phase init (PEP 489) + `Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` means
 //! the module loads in strict own-GIL sub-interpreters with no override.
+//!
+//! Every `unsafe fn` in this crate assumes the caller holds the GIL of the
+//! interpreter that owns the objects passed in; a function documents only the
+//! preconditions it adds to that.
 
 #[cfg(not(Py_3_14))]
 compile_error!("isojson requires CPython 3.14");
@@ -45,10 +49,11 @@ pub(crate) struct ModState {
     pub(crate) types: types::TypeCache,
 }
 
-/// A Python exception is already set (e.g. MemoryError).
-pub(crate) struct PyErrSet;
+/// A Python exception is set in the thread state; the error lives there, not
+/// in this value.
+pub(crate) struct PendingPyErr;
 
-pub(crate) type R<T> = Result<T, PyErrSet>;
+pub(crate) type PyResult<T> = Result<T, PendingPyErr>;
 
 #[inline]
 pub(crate) unsafe fn state(module: *mut PyObject) -> *mut ModState {

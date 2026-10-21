@@ -1,7 +1,8 @@
-//! Date/time text and calendar math. Pure: no Python, no output buffer.
+//! Formats date/time text and does the calendar math, with no Python and no
+//! output buffer.
 //!
 //! The formatters fill caller-owned fixed-size arrays and return the length;
-//! `encode.rs` and `numpy.rs` copy the bytes into `Out`. Every piece is at
+//! `encode.rs` and `numpy.rs` copy the bytes into `OutputBuffer`. Every piece is at
 //! most 16 bytes, within `small_copy`'s limit.
 //!
 //! The text is `isoformat()`'s (design §1a, §8.2). `datetime64` values are
@@ -33,7 +34,7 @@ fn six(buf: &mut [u8], at: usize, v: u32) {
     }
 }
 
-/// `YYYY-MM-DD`, the year zero-padded to four digits as `isoformat()` does.
+/// Writes `YYYY-MM-DD`, with the year zero-padded to four digits as `isoformat()` does.
 pub(crate) fn fmt_ymd(buf: &mut [u8; 10], y: u16, mo: u8, d: u8) -> usize {
     debug_assert!(y <= 9999);
     two(buf, 0, y as u32 / 100);
@@ -45,7 +46,7 @@ pub(crate) fn fmt_ymd(buf: &mut [u8; 10], y: u16, mo: u8, d: u8) -> usize {
     10
 }
 
-/// `HH:MM:SS[.ffffff]`: the fraction only when `us` is non-zero and
+/// Writes `HH:MM:SS[.ffffff]`, with the fraction only when `us` is non-zero and
 /// `OMIT_MICROSECONDS` is not set.
 pub(crate) fn fmt_hms(buf: &mut [u8; 15], h: u8, mi: u8, s: u8, us: u32, opts: u32) -> usize {
     two(buf, 0, h as u32);
@@ -61,7 +62,7 @@ pub(crate) fn fmt_hms(buf: &mut [u8; 15], h: u8, mi: u8, s: u8, us: u32, opts: u
     15
 }
 
-/// `isoformat()`'s offset text for a UTC offset of `total_us` (design §8.2):
+/// Writes `isoformat()`'s offset text for a UTC offset of `total_us`:
 /// `±HH:MM[:SS[.ffffff]]`, or `+00:00` / `Z` (`UTC_Z`) for zero. The caller
 /// passes an offset CPython validated, so `|total_us|` is under 24 hours.
 pub(crate) fn fmt_offset(buf: &mut [u8; 16], total_us: i64, opts: u32) -> usize {
@@ -95,7 +96,7 @@ pub(crate) fn fmt_offset(buf: &mut [u8; 16], total_us: i64, opts: u32) -> usize 
     16
 }
 
-/// The proleptic Gregorian date `days` after 1970-01-01 (Howard Hinnant's
+/// Returns the proleptic Gregorian date `days` after 1970-01-01 (Howard Hinnant's
 /// `civil_from_days`). Proven exhaustively over `MIN_DAYS..=MAX_DAYS`, the
 /// range the caller checks first.
 pub(crate) fn civil_from_days(days: i64) -> (i32, u8, u8) {
@@ -113,7 +114,7 @@ pub(crate) fn civil_from_days(days: i64) -> (i32, u8, u8) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Unit {
+pub(crate) enum TimeUnit {
     Year,
     Month,
     Week,
@@ -132,12 +133,12 @@ pub(crate) enum Unit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Dt64Unit {
-    pub(crate) base: Unit,
+    pub(crate) base: TimeUnit,
     pub(crate) mult: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Parts {
+pub(crate) struct DateTimeParts {
     pub(crate) y: u16,
     pub(crate) mo: u8,
     pub(crate) d: u8,
@@ -148,16 +149,16 @@ pub(crate) struct Parts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Dt64Err {
-    /// Overflow, or a year outside 0000–9999: FR-7 (f).
+pub(crate) enum Dt64Error {
+    /// The value overflows, or its year is outside 0000–9999.
     Unrepresentable,
-    /// A generic-unit value that is not NaT: FR-7 (e).
-    GenericValue,
+    /// The dtype has the generic unit and the value is not NaT.
+    GenericUnit,
 }
 
-/// The unit and multiplier of a `datetime64` dtype from its `dtype.str`:
+/// Parses the unit and multiplier of a `datetime64` dtype from its `dtype.str`:
 /// a byte-order character, `M8`, then nothing (generic) or `[<mult><unit>]`.
-/// `None` for anything else (FR-7 (e)).
+/// Returns `None` for anything else.
 pub(crate) fn parse_dt64(s: &[u8]) -> Option<Dt64Unit> {
     let rest = match s {
         [b'<' | b'>' | b'=' | b'|', b'M', b'8', rest @ ..] => rest,
@@ -165,7 +166,7 @@ pub(crate) fn parse_dt64(s: &[u8]) -> Option<Dt64Unit> {
     };
     if rest.is_empty() {
         return Some(Dt64Unit {
-            base: Unit::Generic,
+            base: TimeUnit::Generic,
             mult: 1,
         });
     }
@@ -185,33 +186,33 @@ pub(crate) fn parse_dt64(s: &[u8]) -> Option<Dt64Unit> {
         m
     };
     let base = match code {
-        b"Y" => Unit::Year,
-        b"M" => Unit::Month,
-        b"W" => Unit::Week,
-        b"D" => Unit::Day,
-        b"h" => Unit::Hour,
-        b"m" => Unit::Minute,
-        b"s" => Unit::Second,
-        b"ms" => Unit::Milli,
-        b"us" => Unit::Micro,
-        b"ns" => Unit::Nano,
-        b"ps" => Unit::Pico,
-        b"fs" => Unit::Femto,
-        b"as" => Unit::Atto,
+        b"Y" => TimeUnit::Year,
+        b"M" => TimeUnit::Month,
+        b"W" => TimeUnit::Week,
+        b"D" => TimeUnit::Day,
+        b"h" => TimeUnit::Hour,
+        b"m" => TimeUnit::Minute,
+        b"s" => TimeUnit::Second,
+        b"ms" => TimeUnit::Milli,
+        b"us" => TimeUnit::Micro,
+        b"ns" => TimeUnit::Nano,
+        b"ps" => TimeUnit::Pico,
+        b"fs" => TimeUnit::Femto,
+        b"as" => TimeUnit::Atto,
         _ => return None,
     };
     Some(Dt64Unit { base, mult })
 }
 
-/// The calendar parts of the `datetime64` value `v` in unit `u` (design §8.3):
+/// Returns the calendar parts of the `datetime64` value `v` in unit `u`:
 /// `Ok(None)` for NaT, `Err` when the value has no representation.
-pub(crate) fn dt64_to_parts(v: i64, u: Dt64Unit) -> Result<Option<Parts>, Dt64Err> {
+pub(crate) fn dt64_to_parts(v: i64, u: Dt64Unit) -> Result<Option<DateTimeParts>, Dt64Error> {
     if v == i64::MIN {
         return Ok(None);
     }
     let date_only = |y: i128, mo: i128| {
         if (0..=9999).contains(&y) {
-            Ok(Some(Parts {
+            Ok(Some(DateTimeParts {
                 y: y as u16,
                 mo: mo as u8,
                 d: 1,
@@ -221,37 +222,37 @@ pub(crate) fn dt64_to_parts(v: i64, u: Dt64Unit) -> Result<Option<Parts>, Dt64Er
                 us: 0,
             }))
         } else {
-            Err(Dt64Err::Unrepresentable)
+            Err(Dt64Error::Unrepresentable)
         }
     };
     let n = (v as i128)
         .checked_mul(u.mult as i128)
-        .ok_or(Dt64Err::Unrepresentable)?;
-    let times = |k: i128| n.checked_mul(k).ok_or(Dt64Err::Unrepresentable);
+        .ok_or(Dt64Error::Unrepresentable)?;
+    let times = |k: i128| n.checked_mul(k).ok_or(Dt64Error::Unrepresentable);
     let us = match u.base {
-        Unit::Generic => return Err(Dt64Err::GenericValue),
-        Unit::Year => return date_only(1970 + n, 1),
-        Unit::Month => return date_only(1970 + n.div_euclid(12), n.rem_euclid(12) + 1),
-        Unit::Week => times(7 * US_PER_DAY)?,
-        Unit::Day => times(US_PER_DAY)?,
-        Unit::Hour => times(3_600_000_000)?,
-        Unit::Minute => times(60_000_000)?,
-        Unit::Second => times(1_000_000)?,
-        Unit::Milli => times(1_000)?,
-        Unit::Micro => n,
+        TimeUnit::Generic => return Err(Dt64Error::GenericUnit),
+        TimeUnit::Year => return date_only(1970 + n, 1),
+        TimeUnit::Month => return date_only(1970 + n.div_euclid(12), n.rem_euclid(12) + 1),
+        TimeUnit::Week => times(7 * US_PER_DAY)?,
+        TimeUnit::Day => times(US_PER_DAY)?,
+        TimeUnit::Hour => times(3_600_000_000)?,
+        TimeUnit::Minute => times(60_000_000)?,
+        TimeUnit::Second => times(1_000_000)?,
+        TimeUnit::Milli => times(1_000)?,
+        TimeUnit::Micro => n,
         // sub-µs units are floored to µs (§1a)
-        Unit::Nano => n.div_euclid(1_000),
-        Unit::Pico => n.div_euclid(1_000_000),
-        Unit::Femto => n.div_euclid(1_000_000_000),
-        Unit::Atto => n.div_euclid(1_000_000_000_000),
+        TimeUnit::Nano => n.div_euclid(1_000),
+        TimeUnit::Pico => n.div_euclid(1_000_000),
+        TimeUnit::Femto => n.div_euclid(1_000_000_000),
+        TimeUnit::Atto => n.div_euclid(1_000_000_000_000),
     };
     let days = us.div_euclid(US_PER_DAY);
     if !(MIN_DAYS as i128..=MAX_DAYS as i128).contains(&days) {
-        return Err(Dt64Err::Unrepresentable);
+        return Err(Dt64Error::Unrepresentable);
     }
     let (y, mo, d) = civil_from_days(days as i64);
     let rem = us.rem_euclid(US_PER_DAY) as u64;
-    Ok(Some(Parts {
+    Ok(Some(DateTimeParts {
         y: y as u16,
         mo,
         d,
