@@ -16,16 +16,18 @@
 use core::cell::RefCell;
 use core::ptr;
 use pyo3_ffi::*;
-use simd_json::{Buffers, ErrorType, Node, StaticNode};
+use simd_json::{Buffers, ErrorType, Node, StaticNode, Tape};
 
 use crate::swar;
 use crate::{state, PendingPyErr, PyResult};
 
 thread_local! {
     /// Per-thread parser scratch: a mutable copy of the input (simd-json
-    /// unescapes strings in place, and Python `bytes` are immutable) and
-    /// simd-json's work buffers. Plain bytes only.
-    static SCRATCH: RefCell<(Vec<u8>, Buffers)> = RefCell::new((Vec::new(), Buffers::new(0)));
+    /// unescapes strings in place, and Python `bytes` are immutable),
+    /// simd-json's work buffers, and the tape, kept empty between calls so
+    /// its allocation is reused. Plain data only.
+    static SCRATCH: RefCell<(Vec<u8>, Buffers, Tape<'static>)> =
+        RefCell::new((Vec::new(), Buffers::new(0), Tape(Vec::new())));
 }
 
 const CACHE_SLOTS: usize = 2048;
@@ -352,20 +354,23 @@ unsafe fn run(module: *mut PyObject, input: &[u8], doc: *mut PyObject) -> *mut P
     let keys = (*state(module)).key_cache;
     SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        let (buf, buffers) = &mut *scratch;
+        let (buf, buffers, kept) = &mut *scratch;
         buf.clear();
         buf.extend_from_slice(input);
-        match simd_json::to_tape_with_buffers(buf, buffers) {
+        let mut tape = core::mem::replace(kept, Tape(Vec::new())).reset();
+        let out = match simd_json::fill_tape(buf, buffers, &mut tape) {
             Err(e) => {
                 let msg = describe(e.error());
                 raise_decode_error(module, &msg, input, doc, e.index());
                 ptr::null_mut()
             }
-            Ok(tape) => match build(&tape.0, keys) {
+            Ok(()) => match build(&tape.0, keys) {
                 Ok(o) => o,
                 Err(PendingPyErr) => ptr::null_mut(),
             },
-        }
+        };
+        *kept = tape.reset();
+        out
     })
 }
 
