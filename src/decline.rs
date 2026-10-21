@@ -22,23 +22,50 @@ pub(crate) enum ArrayDecline {
     UnsupportedDtype,
 }
 
-/// The element types isojson writes.
+/// The element types isojson writes, in the order a scalar's type is looked up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ElementType {
-    Bool,
-    F16,
-    F32,
     F64,
-    I8,
-    I16,
-    I32,
+    F32,
+    F16,
     I64,
-    U8,
-    U16,
-    U32,
+    I32,
+    I16,
+    I8,
     U64,
+    U32,
+    U16,
+    U8,
+    Bool,
     Dt64,
 }
+
+impl ElementType {
+    /// Lists every element type; `ALL[i] as usize == i`, checked at compile time.
+    pub(crate) const ALL: [ElementType; 13] = [
+        ElementType::F64,
+        ElementType::F32,
+        ElementType::F16,
+        ElementType::I64,
+        ElementType::I32,
+        ElementType::I16,
+        ElementType::I8,
+        ElementType::U64,
+        ElementType::U32,
+        ElementType::U16,
+        ElementType::U8,
+        ElementType::Bool,
+        ElementType::Dt64,
+    ];
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < ElementType::ALL.len() {
+        assert!(ElementType::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// Why isojson won't write a numpy object, with the raw evidence it was
 /// decided on.

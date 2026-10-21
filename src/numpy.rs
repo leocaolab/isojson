@@ -5,7 +5,7 @@
 //! the walk. Leaves are read with `ptr::read_unaligned`, so unaligned
 //! C-contiguous arrays are read correctly.
 //!
-//! Whatever isojson can't write is *declined* (FR-7): `Outcome::Declined`
+//! Whatever isojson can't write is *declined* (FR-7): `NumpyError::Declined`
 //! carries a `Decline` with the raw evidence, and `Encoder::call_default_declined`
 //! handles it in one place. An element declined mid-array first rolls the
 //! output back to the array's start, so `default` sees the whole array.
@@ -19,7 +19,6 @@ use crate::decline::{classify, ArrayDecline, Decline, ElementType};
 use crate::encode::{write_datetime, write_int, Encoder};
 use crate::float::{f16_to_f32, write_f32, write_f64};
 use crate::out::OutputBuffer;
-use crate::types::NumpyTypes;
 use crate::{PendingPyErr, PyResult};
 
 /// numpy's `PyArrayInterface` (`__array_struct__`, version 2).
@@ -36,10 +35,23 @@ struct PyArrayInterface {
     descr: *mut PyObject,
 }
 
-pub(crate) enum Outcome {
-    Written,
+/// Why a numpy object wasn't written.
+pub(crate) enum NumpyError {
+    /// isojson won't write it; the encoder hands the whole object to `default`.
     Declined(Decline),
-    Error(PendingPyErr),
+    Py(PendingPyErr),
+}
+
+impl From<PendingPyErr> for NumpyError {
+    fn from(e: PendingPyErr) -> Self {
+        NumpyError::Py(e)
+    }
+}
+
+impl From<Decline> for NumpyError {
+    fn from(d: Decline) -> Self {
+        NumpyError::Declined(d)
+    }
 }
 
 /// Holds `obj.__array_struct__` and releases it on drop.
@@ -279,6 +291,10 @@ fn max_text(elem: ElementType) -> usize {
 /// indent; under `INDENT_2` each dim is indented like a nested list (the
 /// encoder's depth plus the dim). Depth is at most `nd` (numpy caps it at 64)
 /// and doesn't count toward `MAX_DEPTH`.
+///
+/// # Safety
+/// `a.shape` and `a.strides` must hold `a.nd` entries and `p` must point at
+/// the data they describe, with `dim < a.nd`.
 unsafe fn walk<L>(
     enc: &mut Encoder,
     a: &PyArrayInterface,
@@ -336,18 +352,18 @@ where
 }
 
 /// Returns a datetime64 dtype's unit, or a decline if its dtype string doesn't parse.
-unsafe fn dt64_unit(enc: &mut Encoder, obj: *mut PyObject) -> Result<Dt64Unit, Outcome> {
-    let dtype = dtype_str(enc, obj).map_err(Outcome::Error)?;
-    parse_dt64(&dtype).ok_or(Outcome::Declined(Decline::UnparseableDtype { dtype }))
+unsafe fn dt64_unit(enc: &mut Encoder, obj: *mut PyObject) -> Result<Dt64Unit, NumpyError> {
+    let dtype = dtype_str(enc, obj)?;
+    Ok(parse_dt64(&dtype).ok_or(Decline::UnparseableDtype { dtype })?)
 }
 
 /// Writes an exact `ndarray`. On an element decline it first rolls the output
 /// back, so `default` sees the whole array.
-pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> Outcome {
-    let held = match array_struct(enc, obj) {
-        Ok(i) => i,
-        Err(e) => return Outcome::Error(e),
-    };
+pub(crate) unsafe fn serialize_array(
+    enc: &mut Encoder,
+    obj: *mut PyObject,
+) -> Result<(), NumpyError> {
+    let held = array_struct(enc, obj)?;
     let a = &*held.iface;
     let elem = match classify(a.flags, a.nd, a.typekind as u8, a.itemsize) {
         Ok(elem) => elem,
@@ -358,10 +374,7 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
                     shape: core::slice::from_raw_parts(a.shape, a.nd.max(0) as usize).to_vec(),
                 },
                 _ => {
-                    let dtype = match dtype_str(enc, obj) {
-                        Ok(d) => d,
-                        Err(e) => return Outcome::Error(e),
-                    };
+                    let dtype = dtype_str(enc, obj)?;
                     match check {
                         ArrayDecline::NotNative => Decline::NotNative { dtype },
                         ArrayDecline::ZeroDim => Decline::ZeroDim { dtype },
@@ -369,17 +382,14 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
                     }
                 }
             };
-            return Outcome::Declined(reason);
+            return Err(reason.into());
         }
     };
     let shape = core::slice::from_raw_parts(a.shape, a.nd as usize);
     // element-less arrays are walked without reading their unit, as orjson
     // writes them (`[]`, `[[],[]]`) whatever the dtype string says
     let unit = if elem == ElementType::Dt64 && !shape.contains(&0) {
-        match dt64_unit(enc, obj) {
-            Ok(u) => Some(u),
-            Err(o) => return o,
-        }
+        Some(dt64_unit(enc, obj)?)
     } else {
         None
     };
@@ -401,48 +411,20 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
     }
     let r = leaf!(elem, unit, run);
     drop(held);
-    match r {
-        Ok(()) => Outcome::Written,
-        Err(reason) => {
-            enc.out.set_len(start);
-            Outcome::Declined(reason)
-        }
-    }
+    r.map_err(|reason| {
+        enc.out.set_len(start);
+        reason.into()
+    })
 }
 
-/// Returns the element type of a numpy scalar type isojson writes, or `None`.
-fn scalar_elem(np: &NumpyTypes, ty: *mut PyTypeObject) -> Option<ElementType> {
-    let table = [
-        (np.float64, ElementType::F64),
-        (np.float32, ElementType::F32),
-        (np.float16, ElementType::F16),
-        (np.int64, ElementType::I64),
-        (np.int32, ElementType::I32),
-        (np.int16, ElementType::I16),
-        (np.int8, ElementType::I8),
-        (np.uint64, ElementType::U64),
-        (np.uint32, ElementType::U32),
-        (np.uint16, ElementType::U16),
-        (np.uint8, ElementType::U8),
-        (np.bool_, ElementType::Bool),
-        (np.datetime64, ElementType::Dt64),
-    ];
-    table.into_iter().find(|&(t, _)| t == ty).map(|(_, e)| e)
-}
-
-/// Writes an exact numpy scalar of a supported type; returns `None` if `obj` is not one.
+/// Writes an exact numpy scalar whose element type is `elem`.
 pub(crate) unsafe fn serialize_scalar(
     enc: &mut Encoder,
     obj: *mut PyObject,
-    np: NumpyTypes,
-) -> Option<Outcome> {
-    let elem = scalar_elem(&np, Py_TYPE(obj))?;
-    // `np` is not used past this point: the calls below run Python (C1)
+    elem: ElementType,
+) -> Result<(), NumpyError> {
     let unit = if elem == ElementType::Dt64 {
-        match dt64_unit(enc, obj) {
-            Ok(u) => Some(u),
-            Err(o) => return Some(o),
-        }
+        Some(dt64_unit(enc, obj)?)
     } else {
         None
     };
@@ -459,9 +441,5 @@ pub(crate) unsafe fn serialize_scalar(
             leaf(enc, data)
         }};
     }
-    let r = leaf!(elem, unit, one);
-    Some(match r {
-        Ok(()) => Outcome::Written,
-        Err(reason) => Outcome::Declined(reason),
-    })
+    Ok(leaf!(elem, unit, one)?)
 }

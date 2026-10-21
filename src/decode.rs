@@ -72,8 +72,11 @@ impl KeyCache {
         (h.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(0x517c_c1b7_2722_0a95)
     }
 
-    /// Returns a new reference to a `str` equal to `b`, which the caller has
-    /// checked is ASCII and at most `CACHE_MAX_KEY` bytes.
+    /// Returns a new reference to a `str` equal to `b`.
+    ///
+    /// # Safety
+    /// `b` must be ASCII: a hit compares it with the cached string's 1-byte
+    /// data, and a miss builds the string as ASCII without checking.
     #[inline]
     unsafe fn get(&mut self, b: &[u8]) -> PyResult<*mut PyObject> {
         let h = Self::hash(b);
