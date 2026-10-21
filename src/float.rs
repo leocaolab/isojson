@@ -1,4 +1,4 @@
-//! Float formatting.
+//! Formats floats the way orjson does.
 //!
 //! Output matches orjson byte-for-byte: shortest round-trip digits via zmij
 //! (the same algorithm orjson uses), fixed notation for decimal exponents in
@@ -6,7 +6,7 @@
 //! values are `null`.
 
 #[inline]
-pub(crate) fn write_f64(out: &mut crate::out::Out, v: f64) {
+pub(crate) fn write_f64(out: &mut crate::out::OutputBuffer, v: f64) {
     if !v.is_finite() {
         out.extend_from_slice(b"null");
         return;
@@ -14,10 +14,10 @@ pub(crate) fn write_f64(out: &mut crate::out::Out, v: f64) {
     write_finite(out, v);
 }
 
-/// float32, and float16 widened with `f16_to_f32`: the shortest digits that
-/// round-trip through f32, with zmij's f32 notation switch (as orjson).
+/// Writes a float32, or a float16 widened with `f16_to_f32`, as the shortest
+/// digits that round-trip through f32, with zmij's f32 notation switch.
 #[inline]
-pub(crate) fn write_f32(out: &mut crate::out::Out, v: f32) {
+pub(crate) fn write_f32(out: &mut crate::out::OutputBuffer, v: f32) {
     if !v.is_finite() {
         out.extend_from_slice(b"null");
         return;
@@ -35,7 +35,7 @@ pub(crate) fn write_f32(out: &mut crate::out::Out, v: f32) {
 /// measured on x86_64, 25–36 ns per float for values in [0, 1), normals and
 /// integral floats, against 16–18 ns in place.
 #[inline]
-fn write_finite<F: zmij::Float>(out: &mut crate::out::Out, v: F) {
+fn write_finite<F: zmij::Float>(out: &mut crate::out::OutputBuffer, v: F) {
     out.reserve(core::mem::size_of::<zmij::Buffer>());
     unsafe {
         let buf = &mut *out.as_mut_ptr().add(out.len()).cast::<zmij::Buffer>();
@@ -50,8 +50,8 @@ fn write_finite<F: zmij::Float>(out: &mut crate::out::Out, v: F) {
 //
 // `f16_to_f32_fallback` as shipped in orjson (`src/serialize/writer/half.rs`),
 // with `as` casts in place of `cast_signed`/`cast_unsigned` and
-// `f32::from_bits` without `unsafe` (clippy rejects the redundant block). Exact: every f16 is an f32. Proven over all 65,536 inputs
-// by E2E-12.
+// `f32::from_bits` without `unsafe` (clippy rejects the redundant block).
+// It is exact, since every f16 is an f32; E2E-12 checks all 65,536 inputs.
 pub(crate) const fn f16_to_f32(i: u16) -> f32 {
     if i & 0x7FFFu16 == 0 {
         return f32::from_bits((i as u32) << 16);
@@ -79,11 +79,11 @@ pub(crate) const fn f16_to_f32(i: u16) -> f32 {
     f32::from_bits(sign | exp | man)
 }
 
-/// Append up to 32 bytes without a `memcpy` call: two possibly-overlapping
+/// Appends up to 32 bytes without a `memcpy` call: two possibly-overlapping
 /// fixed-size copies cover every length in a size class, and fixed-size
 /// copies compile to plain loads/stores. Never reads outside `src`.
 #[inline(always)]
-pub(crate) fn small_copy(out: &mut crate::out::Out, src: &[u8]) {
+pub(crate) fn small_copy(out: &mut crate::out::OutputBuffer, src: &[u8]) {
     let n = src.len();
     debug_assert!(n <= 32);
     out.reserve(n);

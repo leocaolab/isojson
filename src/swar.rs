@@ -8,9 +8,9 @@ fn has_zero(w: u64) -> u64 {
     w.wrapping_sub(LO) & !w & HI
 }
 
-/// Does this word contain a byte that is special inside a JSON string:
-/// a control character (< 0x20), `"` or `\`? Exact (no false negatives or
-/// positives on the "any" question).
+/// Returns whether this word contains a byte that is special inside a JSON
+/// string: a control character (< 0x20), `"` or `\`. It has no false
+/// negatives or false positives.
 #[inline(always)]
 pub(crate) fn has_special(w: u64) -> bool {
     let ctrl = w.wrapping_sub(LO * 0x20) & !w & HI;

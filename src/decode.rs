@@ -1,4 +1,4 @@
-//! `loads`: JSON -> Python objects.
+//! Implements `loads`, which turns JSON into Python objects.
 //!
 //! Parsing is done by simd-json (a pure-Rust port of simdjson), which turns
 //! the document into a flat "tape" of nodes where every array and object
@@ -19,7 +19,7 @@ use pyo3_ffi::*;
 use simd_json::{Buffers, ErrorType, Node, StaticNode};
 
 use crate::swar;
-use crate::{state, PyErrSet, R};
+use crate::{state, PendingPyErr, PyResult};
 
 thread_local! {
     /// Per-thread parser scratch: a mutable copy of the input (simd-json
@@ -45,7 +45,7 @@ impl KeyCache {
         })
     }
 
-    /// Release every cached key. Must run while the owning interpreter is
+    /// Releases every cached key. It must run while the owning interpreter is
     /// alive and holds its GIL (module clear/free satisfy both).
     pub(crate) unsafe fn clear(&mut self) {
         for slot in self.slots.iter_mut() {
@@ -70,10 +70,10 @@ impl KeyCache {
         (h.rotate_left(5) ^ u64::from_le_bytes(tail)).wrapping_mul(0x517c_c1b7_2722_0a95)
     }
 
-    /// New reference to a `str` equal to `b` (which the caller has checked is
-    /// ASCII and at most CACHE_MAX_KEY bytes).
+    /// Returns a new reference to a `str` equal to `b`, which the caller has
+    /// checked is ASCII and at most `CACHE_MAX_KEY` bytes.
     #[inline]
-    unsafe fn get(&mut self, b: &[u8]) -> R<*mut PyObject> {
+    unsafe fn get(&mut self, b: &[u8]) -> PyResult<*mut PyObject> {
         let h = Self::hash(b);
         let slot = &mut self.slots[(h as usize) & (CACHE_SLOTS - 1)];
         if slot.0 == h && !slot.1.is_null() {
@@ -97,28 +97,28 @@ impl KeyCache {
 }
 
 #[inline]
-unsafe fn new_ascii(b: &[u8]) -> R<*mut PyObject> {
+unsafe fn new_ascii(b: &[u8]) -> PyResult<*mut PyObject> {
     let o = PyUnicode_New(b.len() as Py_ssize_t, 127);
     if o.is_null() {
-        return Err(PyErrSet);
+        return Err(PendingPyErr);
     }
     ptr::copy_nonoverlapping(b.as_ptr(), PyUnicode_DATA(o).cast::<u8>(), b.len());
     Ok(o)
 }
 
-/// orjson: 1024 nested containers ok, 1025 fails.
+/// Turns a null C-API result into `Err`; the Python error is already set.
 #[inline]
-unsafe fn new_ref(p: *mut PyObject) -> R<*mut PyObject> {
+unsafe fn new_ref(p: *mut PyObject) -> PyResult<*mut PyObject> {
     if p.is_null() {
-        Err(PyErrSet)
+        Err(PendingPyErr)
     } else {
         Ok(p)
     }
 }
 
-/// `str` from UTF-8 that simd-json has already validated.
+/// Builds a `str` from bytes that simd-json has already validated as UTF-8.
 #[inline]
-unsafe fn make_str(b: &[u8]) -> R<*mut PyObject> {
+unsafe fn make_str(b: &[u8]) -> PyResult<*mut PyObject> {
     if swar::is_ascii(b) {
         return new_ascii(b);
     }
@@ -128,22 +128,22 @@ unsafe fn make_str(b: &[u8]) -> R<*mut PyObject> {
     ))
 }
 
-/// A container being filled: `obj` owns the items inserted so far.
-struct Open {
+/// A list or dict being filled; `obj` owns the items inserted so far.
+struct PartialContainer {
     obj: *mut PyObject,
     is_list: bool,
-    /// next list index / dict entries inserted so far
+    /// Counts the items inserted so far, which is also the next list index.
     filled: usize,
     len: usize,
-    /// dict only: key awaiting its value (owned), or null
+    /// Holds the dict key awaiting its value (owned); it is null for a list.
     key: *mut PyObject,
 }
 
-/// Releases every partially built container if building fails midway.
-/// (A list with unfilled NULL slots is safe to release.)
-struct OpenStack(Vec<Open>);
+/// Releases every partially built container if building fails midway; a list
+/// with unfilled NULL slots is safe to release.
+struct PartialContainers(Vec<PartialContainer>);
 
-impl Drop for OpenStack {
+impl Drop for PartialContainers {
     fn drop(&mut self) {
         for o in self.0.drain(..) {
             unsafe {
@@ -156,9 +156,9 @@ impl Drop for OpenStack {
     }
 }
 
-/// Build the Python value for `nodes` (one complete JSON document).
-unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> R<*mut PyObject> {
-    let mut stack = OpenStack(Vec::new());
+/// Builds the Python value for `nodes` (one complete JSON document).
+unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> PyResult<*mut PyObject> {
+    let mut stack = PartialContainers(Vec::new());
     let mut i = 0;
     loop {
         // In an object, the next node is a key.
@@ -196,7 +196,7 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> R<*mut PyObject> {
             Node::Array { len, .. } => {
                 let l = new_ref(PyList_New(len as Py_ssize_t))?;
                 if len > 0 {
-                    stack.0.push(Open {
+                    stack.0.push(PartialContainer {
                         obj: l,
                         is_list: true,
                         filled: 0,
@@ -210,7 +210,7 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> R<*mut PyObject> {
             Node::Object { len, .. } => {
                 let d = new_ref(PyDict_New())?;
                 if len > 0 {
-                    stack.0.push(Open {
+                    stack.0.push(PartialContainer {
                         obj: d,
                         is_list: false,
                         filled: 0,
@@ -237,7 +237,7 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> R<*mut PyObject> {
                 Py_DECREF(top.key);
                 top.key = ptr::null_mut();
                 if rc < 0 {
-                    return Err(PyErrSet);
+                    return Err(PendingPyErr);
                 }
             }
             top.filled += 1;
@@ -250,8 +250,8 @@ unsafe fn build(nodes: &[Node<'_>], keys: *mut KeyCache) -> R<*mut PyObject> {
     }
 }
 
-/// Human-readable message for a simd-json error (never its internal
-/// variant name).
+/// Returns a human-readable message for a simd-json error, never its internal
+/// variant name.
 fn describe(e: &ErrorType) -> String {
     match e {
         ErrorType::Eof => "unexpected end of data".into(),
@@ -289,7 +289,7 @@ fn describe(e: &ErrorType) -> String {
     }
 }
 
-/// Raise this interpreter's `isojson.JSONDecodeError(msg, doc, pos)`.
+/// Raises this interpreter's `isojson.JSONDecodeError(msg, doc, pos)`.
 /// `pos` is converted from a byte offset to a character offset, which is
 /// what `json.JSONDecodeError` expects.
 unsafe fn raise_decode_error(
@@ -363,7 +363,7 @@ unsafe fn run(module: *mut PyObject, input: &[u8], doc: *mut PyObject) -> *mut P
             }
             Ok(tape) => match build(&tape.0, keys) {
                 Ok(o) => o,
-                Err(PyErrSet) => ptr::null_mut(),
+                Err(PendingPyErr) => ptr::null_mut(),
             },
         }
     })

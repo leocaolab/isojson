@@ -1,8 +1,7 @@
-//! Output buffer that writes straight into the result `bytes` object.
+//! Writes `dumps` output straight into the result `bytes` object, which saves
+//! copying it out of a separate buffer at the end.
 //!
-//! `dumps` used to write into a Rust `Vec` and copy it into a new `bytes` at
-//! the end. Writing into the `bytes` object's own storage removes that final
-//! copy. The initial capacity is the previous output size on this thread, so
+//! The initial capacity is the previous output size on this thread, so
 //! repeated calls of a similar size rarely grow; at the end the object is
 //! shrunk to the exact length.
 //!
@@ -10,7 +9,7 @@
 //! `_PyBytes_Resize`: on failure `_PyBytes_Resize` frees the object and the
 //! bytes written so far would be lost. If even that allocation fails, writing
 //! continues in a Rust `Vec` ("spill") and the result is built from it at the
-//! end — the same behaviour the Vec-only buffer had.
+//! end.
 
 use core::ptr;
 use pyo3_ffi::*;
@@ -30,7 +29,7 @@ extern "C" {
     fn _PyBytes_Resize(obj: *mut *mut PyObject, newsize: Py_ssize_t) -> core::ffi::c_int;
 }
 
-pub(crate) struct Out {
+pub(crate) struct OutputBuffer {
     /// The `bytes` being written, or null once spilled to `spill`.
     obj: *mut PyObject,
     spill: Vec<u8>,
@@ -39,8 +38,8 @@ pub(crate) struct Out {
     cap: usize,
 }
 
-impl Out {
-    /// `None` if the first allocation fails (MemoryError is set).
+impl OutputBuffer {
+    /// Returns `None`, with MemoryError set, if the first allocation fails.
     pub(crate) unsafe fn new() -> Option<Self> {
         let hint = HINT.get();
         let cap = (hint + hint / 8).max(MIN_CAP);
@@ -48,7 +47,7 @@ impl Out {
         if obj.is_null() {
             return None;
         }
-        Some(Out {
+        Some(OutputBuffer {
             obj,
             spill: Vec::new(),
             ptr: PyBytes_AsString(obj).cast(),
@@ -132,7 +131,7 @@ impl Out {
         self.len += s.len();
     }
 
-    /// Hand the result to Python: a `bytes` of exactly `len`, or null with
+    /// Hands the result to Python: a `bytes` of exactly `len`, or null with
     /// MemoryError set.
     pub(crate) unsafe fn finish(mut self) -> *mut PyObject {
         HINT.set(self.len);
@@ -147,7 +146,7 @@ impl Out {
     }
 }
 
-impl Drop for Out {
+impl Drop for OutputBuffer {
     fn drop(&mut self) {
         if !self.obj.is_null() {
             unsafe { Py_DECREF(self.obj) };

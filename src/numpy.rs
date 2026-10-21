@@ -1,4 +1,4 @@
-//! numpy arrays and scalars (design C4, FR-6…9).
+//! Writes numpy arrays and scalars.
 //!
 //! Arrays are read through `__array_struct__` (PyArrayInterface v2): no numpy
 //! headers, no `import_array`, no numpy C-API global. The capsule is held for
@@ -6,7 +6,7 @@
 //! C-contiguous arrays are read correctly.
 //!
 //! Whatever isojson can't write is *declined* (FR-7): `Outcome::Declined`
-//! carries a `Reason` with the raw evidence, and `Encoder::call_default_declined`
+//! carries a `Decline` with the raw evidence, and `Encoder::call_default_declined`
 //! handles it in one place. An element declined mid-array first rolls the
 //! output back to the array's start, so `default` sees the whole array.
 
@@ -14,13 +14,13 @@ use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use pyo3_ffi::*;
 
-use crate::datetime::{dt64_to_parts, parse_dt64, Dt64Err, Dt64Unit};
-use crate::decline::{classify, Check, Elem, Reason};
+use crate::datetime::{dt64_to_parts, parse_dt64, Dt64Error, Dt64Unit};
+use crate::decline::{classify, ArrayDecline, Decline, ElementType};
 use crate::encode::{write_datetime, write_int, Encoder};
 use crate::float::{f16_to_f32, write_f32, write_f64};
-use crate::out::Out;
+use crate::out::OutputBuffer;
 use crate::types::NumpyTypes;
-use crate::{PyErrSet, R};
+use crate::{PendingPyErr, PyResult};
 
 /// numpy's `PyArrayInterface` (`__array_struct__`, version 2).
 #[repr(C)]
@@ -38,55 +38,55 @@ struct PyArrayInterface {
 
 pub(crate) enum Outcome {
     Written,
-    Declined(Reason),
-    Error(PyErrSet),
+    Declined(Decline),
+    Error(PendingPyErr),
 }
 
-/// `obj.__array_struct__`, held until dropped.
-struct Interface {
+/// Holds `obj.__array_struct__` and releases it on drop.
+struct ArrayStruct {
     capsule: *mut PyObject,
     iface: *const PyArrayInterface,
 }
 
-impl Drop for Interface {
+impl Drop for ArrayStruct {
     fn drop(&mut self) {
         unsafe { Py_DECREF(self.capsule) };
     }
 }
 
-unsafe fn interface(enc: &mut Encoder, obj: *mut PyObject) -> R<Interface> {
+unsafe fn array_struct(enc: &mut Encoder, obj: *mut PyObject) -> PyResult<ArrayStruct> {
     debug_assert!(enc.guard);
     let capsule = PyObject_GetAttr(obj, (*enc.cache).names.array_struct);
     if capsule.is_null() {
-        return Err(PyErrSet);
+        return Err(PendingPyErr);
     }
     let iface = PyCapsule_GetPointer(capsule, ptr::null()).cast::<PyArrayInterface>();
     if iface.is_null() || (*iface).two != 2 {
         Py_DECREF(capsule);
         crate::encode::raise_type_error_from_current("numpy array is malformed");
-        return Err(PyErrSet);
+        return Err(PendingPyErr);
     }
-    Ok(Interface { capsule, iface })
+    Ok(ArrayStruct { capsule, iface })
 }
 
-/// `obj.dtype.str`, the raw bytes (the evidence FR-7 reports, and the
-/// datetime64 unit).
-unsafe fn dtype_str(enc: &mut Encoder, obj: *mut PyObject) -> R<Vec<u8>> {
+/// Returns the raw bytes of `obj.dtype.str`, which are both the decline
+/// evidence and the datetime64 unit.
+unsafe fn dtype_str(enc: &mut Encoder, obj: *mut PyObject) -> PyResult<Vec<u8>> {
     debug_assert!(enc.guard);
     let names = &(*enc.cache).names;
     let dtype = PyObject_GetAttr(obj, names.dtype);
     if dtype.is_null() {
-        return Err(PyErrSet);
+        return Err(PendingPyErr);
     }
     let s = PyObject_GetAttr(dtype, names.str);
     Py_DECREF(dtype);
     if s.is_null() {
-        return Err(PyErrSet);
+        return Err(PendingPyErr);
     }
     let mut n: Py_ssize_t = 0;
     let p = PyUnicode_AsUTF8AndSize(s, &mut n);
     let out = if p.is_null() {
-        Err(PyErrSet)
+        Err(PendingPyErr)
     } else {
         Ok(core::slice::from_raw_parts(p.cast::<u8>(), n as usize).to_vec())
     };
@@ -99,9 +99,9 @@ unsafe fn rd<T>(p: *const u8) -> T {
     ptr::read_unaligned(p.cast::<T>())
 }
 
-/// One datetime64 value: `null` for NaT, the §1a text, or the FR-7 reason.
+/// Writes one datetime64 value (`null` for NaT), or returns why it can't.
 #[inline]
-fn write_dt64(enc: &mut Encoder, v: i64, unit: Dt64Unit) -> Result<(), Reason> {
+fn write_dt64(enc: &mut Encoder, v: i64, unit: Dt64Unit) -> Result<(), Decline> {
     match dt64_to_parts(v, unit) {
         Ok(None) => {
             enc.out.extend_from_slice(b"null");
@@ -112,8 +112,8 @@ fn write_dt64(enc: &mut Encoder, v: i64, unit: Dt64Unit) -> Result<(), Reason> {
             write_datetime(&mut enc.out, &p, offset, enc.opts);
             Ok(())
         }
-        Err(Dt64Err::GenericValue) => Err(Reason::GenericValue { v }),
-        Err(Dt64Err::Unrepresentable) => Err(Reason::Unrepresentable { v, unit }),
+        Err(Dt64Error::GenericUnit) => Err(Decline::GenericUnit { v }),
+        Err(Dt64Error::Unrepresentable) => Err(Decline::Unrepresentable { v, unit }),
     }
 }
 
@@ -126,61 +126,61 @@ fn write_bool(enc: &mut Encoder, b: u8) {
     }
 }
 
-/// Write one element of type `elem` at `p`, one closure per dtype so each
-/// walk is monomorphic. `unit` is the datetime64 unit; it is `None` only for
+/// Expands to one closure per element type that writes the element at `p`,
+/// so each walk is monomorphic. `unit` is the datetime64 unit; it is `None` only for
 /// an element-less array, whose walk visits no leaf.
 macro_rules! leaf {
     ($elem:expr, $unit:expr, $body:ident) => {
         match $elem {
-            Elem::Bool => $body!(|e: &mut Encoder, p| {
+            ElementType::Bool => $body!(|e: &mut Encoder, p| {
                 write_bool(e, rd::<u8>(p));
                 Ok(())
             }),
-            Elem::F16 => $body!(|e: &mut Encoder, p| {
+            ElementType::F16 => $body!(|e: &mut Encoder, p| {
                 write_f32(&mut e.out, f16_to_f32(rd::<u16>(p)));
                 Ok(())
             }),
-            Elem::F32 => $body!(|e: &mut Encoder, p| {
+            ElementType::F32 => $body!(|e: &mut Encoder, p| {
                 write_f32(&mut e.out, rd::<f32>(p));
                 Ok(())
             }),
-            Elem::F64 => $body!(|e: &mut Encoder, p| {
+            ElementType::F64 => $body!(|e: &mut Encoder, p| {
                 write_f64(&mut e.out, rd::<f64>(p));
                 Ok(())
             }),
-            Elem::I8 => $body!(|e: &mut Encoder, p| {
+            ElementType::I8 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<i8>(p));
                 Ok(())
             }),
-            Elem::I16 => $body!(|e: &mut Encoder, p| {
+            ElementType::I16 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<i16>(p));
                 Ok(())
             }),
-            Elem::I32 => $body!(|e: &mut Encoder, p| {
+            ElementType::I32 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<i32>(p));
                 Ok(())
             }),
-            Elem::I64 => $body!(|e: &mut Encoder, p| {
+            ElementType::I64 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<i64>(p));
                 Ok(())
             }),
-            Elem::U8 => $body!(|e: &mut Encoder, p| {
+            ElementType::U8 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<u8>(p));
                 Ok(())
             }),
-            Elem::U16 => $body!(|e: &mut Encoder, p| {
+            ElementType::U16 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<u16>(p));
                 Ok(())
             }),
-            Elem::U32 => $body!(|e: &mut Encoder, p| {
+            ElementType::U32 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<u32>(p));
                 Ok(())
             }),
-            Elem::U64 => $body!(|e: &mut Encoder, p| {
+            ElementType::U64 => $body!(|e: &mut Encoder, p| {
                 write_int(&mut e.out, rd::<u64>(p));
                 Ok(())
             }),
-            Elem::Dt64 => match $unit {
+            ElementType::Dt64 => match $unit {
                 Some(unit) => $body!(|e: &mut Encoder, p| write_dt64(e, rd::<i64>(p), unit)),
                 None => $body!(|_: &mut Encoder, _| Ok(())),
             },
@@ -192,11 +192,16 @@ macro_rules! leaf {
 const ROW_CHUNK: isize = 1024;
 
 /// Writes a whole compact row `[a,b,…]` of `n` elements `stride` apart.
-type RowFn = unsafe fn(&mut Out, *const u8, isize, isize);
+type RowFn = unsafe fn(&mut OutputBuffer, *const u8, isize, isize);
 
-/// A compact integer row, written through a raw pointer after one reserve:
-/// no per-element capacity check or `Result`. Integers can't be declined.
-unsafe fn write_int_row<T: itoa::Integer>(out: &mut Out, p: *const u8, n: isize, stride: isize) {
+/// Writes a compact integer row through a raw pointer after one reserve, with
+/// no per-element capacity check or `Result`; integers can't be declined.
+unsafe fn write_int_row<T: itoa::Integer>(
+    out: &mut OutputBuffer,
+    p: *const u8,
+    n: isize,
+    stride: isize,
+) {
     // the longest integer text is 20 bytes, plus a comma, plus the brackets
     out.reserve(n as usize * 21 + 2);
     let base = out.as_mut_ptr();
@@ -217,7 +222,7 @@ unsafe fn write_int_row<T: itoa::Integer>(out: &mut Out, p: *const u8, n: isize,
     out.set_len(dst.offset_from(base) as usize);
 }
 
-/// Copy `s` (at most 20 bytes) to `dst` with fixed-size, possibly
+/// Copies `s` (at most 20 bytes) to `dst` with fixed-size, possibly
 /// overlapping copies, as `small_copy` does, and return the end. Never reads
 /// or writes outside `s` / `dst[..s.len()]`.
 #[inline(always)]
@@ -241,38 +246,38 @@ unsafe fn copy_digits(s: &[u8], dst: *mut u8) -> *mut u8 {
     dst.add(n)
 }
 
-fn int_row(elem: Elem) -> Option<RowFn> {
+fn int_row(elem: ElementType) -> Option<RowFn> {
     Some(match elem {
-        Elem::I8 => write_int_row::<i8>,
-        Elem::I16 => write_int_row::<i16>,
-        Elem::I32 => write_int_row::<i32>,
-        Elem::I64 => write_int_row::<i64>,
-        Elem::U8 => write_int_row::<u8>,
-        Elem::U16 => write_int_row::<u16>,
-        Elem::U32 => write_int_row::<u32>,
-        Elem::U64 => write_int_row::<u64>,
+        ElementType::I8 => write_int_row::<i8>,
+        ElementType::I16 => write_int_row::<i16>,
+        ElementType::I32 => write_int_row::<i32>,
+        ElementType::I64 => write_int_row::<i64>,
+        ElementType::U8 => write_int_row::<u8>,
+        ElementType::U16 => write_int_row::<u16>,
+        ElementType::U32 => write_int_row::<u32>,
+        ElementType::U64 => write_int_row::<u64>,
         _ => return None,
     })
 }
 
-/// The longest text one element of `elem` can have.
-fn max_text(elem: Elem) -> usize {
+/// Returns the longest text, in bytes, that one element of `elem` can have.
+fn max_text(elem: ElementType) -> usize {
     match elem {
-        Elem::Bool => 5,
-        Elem::I8 | Elem::U8 => 4,
-        Elem::I16 | Elem::U16 => 6,
-        Elem::I32 | Elem::U32 => 11,
-        Elem::I64 | Elem::U64 => 20,
-        Elem::F16 | Elem::F32 => 16,
-        Elem::F64 => 24,
+        ElementType::Bool => 5,
+        ElementType::I8 | ElementType::U8 => 4,
+        ElementType::I16 | ElementType::U16 => 6,
+        ElementType::I32 | ElementType::U32 => 11,
+        ElementType::I64 | ElementType::U64 => 20,
+        ElementType::F16 | ElementType::F32 => 16,
+        ElementType::F64 => 24,
         // "YYYY-MM-DDTHH:MM:SS.ffffff+00:00" quoted
-        Elem::Dt64 => 34,
+        ElementType::Dt64 => 34,
     }
 }
 
-/// The FR-6 walk: nested dims → nested lists, a 0-length dim → `[]` with no
-/// indent, and under `INDENT_2` each dim indented like a nested list (the
-/// encoder's depth + the dim). Depth is at most `nd` (numpy caps it at 64)
+/// Writes nested dims as nested lists and a 0-length dim as `[]` with no
+/// indent; under `INDENT_2` each dim is indented like a nested list (the
+/// encoder's depth plus the dim). Depth is at most `nd` (numpy caps it at 64)
 /// and doesn't count toward `MAX_DEPTH`.
 unsafe fn walk<L>(
     enc: &mut Encoder,
@@ -282,9 +287,9 @@ unsafe fn walk<L>(
     dim: usize,
     p: *const u8,
     leaf: &mut L,
-) -> Result<(), Reason>
+) -> Result<(), Decline>
 where
-    L: FnMut(&mut Encoder, *const u8) -> Result<(), Reason>,
+    L: FnMut(&mut Encoder, *const u8) -> Result<(), Decline>,
 {
     let n = *a.shape.add(dim);
     if n == 0 {
@@ -330,16 +335,16 @@ where
     Ok(())
 }
 
-/// A datetime64 dtype's unit, or the FR-7 (e) decline.
+/// Returns a datetime64 dtype's unit, or a decline if its dtype string doesn't parse.
 unsafe fn dt64_unit(enc: &mut Encoder, obj: *mut PyObject) -> Result<Dt64Unit, Outcome> {
     let dtype = dtype_str(enc, obj).map_err(Outcome::Error)?;
-    parse_dt64(&dtype).ok_or(Outcome::Declined(Reason::UnparseableDtype { dtype }))
+    parse_dt64(&dtype).ok_or(Outcome::Declined(Decline::UnparseableDtype { dtype }))
 }
 
-/// An exact `ndarray` (FR-6, FR-7). Rolls the output back before any
-/// element decline.
+/// Writes an exact `ndarray`. On an element decline it first rolls the output
+/// back, so `default` sees the whole array.
 pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> Outcome {
-    let held = match interface(enc, obj) {
+    let held = match array_struct(enc, obj) {
         Ok(i) => i,
         Err(e) => return Outcome::Error(e),
     };
@@ -348,7 +353,7 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
         Ok(elem) => elem,
         Err(check) => {
             let reason = match check {
-                Check::NotContiguous => Reason::NotContiguous {
+                ArrayDecline::NotContiguous => Decline::NotContiguous {
                     flags: a.flags,
                     shape: core::slice::from_raw_parts(a.shape, a.nd.max(0) as usize).to_vec(),
                 },
@@ -358,9 +363,9 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
                         Err(e) => return Outcome::Error(e),
                     };
                     match check {
-                        Check::NotNative => Reason::NotNative { dtype },
-                        Check::ZeroDim => Reason::ZeroDim { dtype },
-                        _ => Reason::Dtype { dtype },
+                        ArrayDecline::NotNative => Decline::NotNative { dtype },
+                        ArrayDecline::ZeroDim => Decline::ZeroDim { dtype },
+                        _ => Decline::UnsupportedDtype { dtype },
                     }
                 }
             };
@@ -370,7 +375,7 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
     let shape = core::slice::from_raw_parts(a.shape, a.nd as usize);
     // element-less arrays are walked without reading their unit, as orjson
     // writes them (`[]`, `[[],[]]`) whatever the dtype string says
-    let unit = if elem == Elem::Dt64 && !shape.contains(&0) {
+    let unit = if elem == ElementType::Dt64 && !shape.contains(&0) {
         match dt64_unit(enc, obj) {
             Ok(u) => Some(u),
             Err(o) => return o,
@@ -405,27 +410,27 @@ pub(crate) unsafe fn serialize_array(enc: &mut Encoder, obj: *mut PyObject) -> O
     }
 }
 
-/// The FR-8 scalar types; `None` for anything else.
-fn scalar_elem(np: &NumpyTypes, ty: *mut PyTypeObject) -> Option<Elem> {
+/// Returns the element type of a numpy scalar type isojson writes, or `None`.
+fn scalar_elem(np: &NumpyTypes, ty: *mut PyTypeObject) -> Option<ElementType> {
     let table = [
-        (np.float64, Elem::F64),
-        (np.float32, Elem::F32),
-        (np.float16, Elem::F16),
-        (np.int64, Elem::I64),
-        (np.int32, Elem::I32),
-        (np.int16, Elem::I16),
-        (np.int8, Elem::I8),
-        (np.uint64, Elem::U64),
-        (np.uint32, Elem::U32),
-        (np.uint16, Elem::U16),
-        (np.uint8, Elem::U8),
-        (np.bool_, Elem::Bool),
-        (np.datetime64, Elem::Dt64),
+        (np.float64, ElementType::F64),
+        (np.float32, ElementType::F32),
+        (np.float16, ElementType::F16),
+        (np.int64, ElementType::I64),
+        (np.int32, ElementType::I32),
+        (np.int16, ElementType::I16),
+        (np.int8, ElementType::I8),
+        (np.uint64, ElementType::U64),
+        (np.uint32, ElementType::U32),
+        (np.uint16, ElementType::U16),
+        (np.uint8, ElementType::U8),
+        (np.bool_, ElementType::Bool),
+        (np.datetime64, ElementType::Dt64),
     ];
     table.into_iter().find(|&(t, _)| t == ty).map(|(_, e)| e)
 }
 
-/// An exact numpy scalar of an FR-8 type; `None` if `obj` is not one.
+/// Writes an exact numpy scalar of a supported type; returns `None` if `obj` is not one.
 pub(crate) unsafe fn serialize_scalar(
     enc: &mut Encoder,
     obj: *mut PyObject,
@@ -433,7 +438,7 @@ pub(crate) unsafe fn serialize_scalar(
 ) -> Option<Outcome> {
     let elem = scalar_elem(&np, Py_TYPE(obj))?;
     // `np` is not used past this point: the calls below run Python (C1)
-    let unit = if elem == Elem::Dt64 {
+    let unit = if elem == ElementType::Dt64 {
         match dt64_unit(enc, obj) {
             Ok(u) => Some(u),
             Err(o) => return Some(o),
@@ -441,7 +446,7 @@ pub(crate) unsafe fn serialize_scalar(
     } else {
         None
     };
-    // O-2: the value is read from the scalar's layout, right after the
+    // the value is read from the scalar's layout, right after the
     // object header (numpy's `Py<Type>ScalarObject { PyObject_HEAD; obval }`),
     // as orjson does; measured several times faster than a capsule per scalar
     let data = obj

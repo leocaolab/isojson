@@ -1,4 +1,4 @@
-//! `dumps`: Python object -> JSON bytes, written in a single pass.
+//! Implements `dumps`, which writes a Python object as JSON bytes in one pass.
 //!
 //! Multi-interpreter safety: the encoder only *borrows* objects for the
 //! duration of one call, on the calling thread, under the calling
@@ -18,11 +18,11 @@ use core::ffi::CStr;
 use core::ptr;
 use pyo3_ffi::*;
 
-use crate::datetime::{fmt_hms, fmt_offset, fmt_ymd, Parts};
-use crate::decline::{reason_message, reason_note, Reason};
+use crate::datetime::{fmt_hms, fmt_offset, fmt_ymd, DateTimeParts};
+use crate::decline::{decline_message, decline_note, Decline};
 use crate::float::{small_copy, write_f64};
 use crate::numpy::Outcome;
-use crate::out::Out;
+use crate::out::OutputBuffer;
 use crate::types::{DtTypes, TypeCache};
 use crate::*;
 
@@ -43,7 +43,8 @@ const UNSUPPORTED_OPTS: &[(u32, &str)] = &[(OPT_NON_STR_KEYS, "OPT_NON_STR_KEYS"
 
 static HEX: &[u8; 16] = b"0123456789abcdef";
 
-/// 0 = copy through; otherwise the escape letter (`u` = \u00XX form).
+/// Maps each byte to 0 if it is copied through, or to its escape letter, where
+/// `u` means the `\u00XX` form.
 static ESCAPE: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut i = 0;
@@ -71,12 +72,12 @@ unsafe fn type_name(obj: *mut PyObject) -> String {
     CStr::from_ptr((*ty).tp_name).to_string_lossy().into_owned()
 }
 
-/// Raise `TypeError(msg)` with the currently raised exception as `__cause__`.
+/// Raises `TypeError(msg)` with the currently raised exception as `__cause__`.
 pub(crate) unsafe fn raise_type_error_from_current(msg: &str) {
     raise_type_error_caused_by(msg, PyErr_GetRaisedException());
 }
 
-/// Raise `TypeError(msg)` with `cause` (a strong reference, stolen; may be
+/// Raises `TypeError(msg)` with `cause` (a strong reference, stolen; may be
 /// null) as `__cause__`.
 unsafe fn raise_type_error_caused_by(msg: &str, cause: *mut PyObject) {
     raise_type_error(msg);
@@ -87,8 +88,8 @@ unsafe fn raise_type_error_caused_by(msg: &str, cause: *mut PyObject) {
     }
 }
 
-/// `<Exc>: <str(exc)>`, or `<Exc>` when the text is empty or `str()` fails
-/// (the exception itself still travels as `__cause__`).
+/// Returns `<Exc>: <str(exc)>`, or just `<Exc>` when the text is empty or
+/// `str()` fails; the exception itself still travels as `__cause__`.
 unsafe fn describe_exception(exc: *mut PyObject) -> String {
     let name = type_name(exc);
     let s = PyObject_Str(exc);
@@ -107,21 +108,26 @@ unsafe fn describe_exception(exc: *mut PyObject) -> String {
     }
 }
 
-fn write_ymd(out: &mut Out, y: u16, mo: u8, d: u8) {
+fn write_ymd(out: &mut OutputBuffer, y: u16, mo: u8, d: u8) {
     let mut b = [0u8; 10];
     let n = fmt_ymd(&mut b, y, mo, d);
     small_copy(out, &b[..n]);
 }
 
-fn write_offset(out: &mut Out, total_us: i64, opts: u32) {
+fn write_offset(out: &mut OutputBuffer, total_us: i64, opts: u32) {
     let mut b = [0u8; 16];
     let n = fmt_offset(&mut b, total_us, opts);
     small_copy(out, &b[..n]);
 }
 
-/// A quoted `YYYY-MM-DDTHH:MM:SS[.ffffff][offset]`, the datetime text of
-/// design §1a for `datetime` and `datetime64` alike.
-pub(crate) fn write_datetime(out: &mut Out, p: &Parts, offset: Option<i64>, opts: u32) {
+/// Writes a quoted `YYYY-MM-DDTHH:MM:SS[.ffffff][offset]`, the same text for
+/// `datetime` and `datetime64`.
+pub(crate) fn write_datetime(
+    out: &mut OutputBuffer,
+    p: &DateTimeParts,
+    offset: Option<i64>,
+    opts: u32,
+) {
     out.push(b'"');
     write_ymd(out, p.y, p.mo, p.d);
     out.push(b'T');
@@ -134,7 +140,7 @@ pub(crate) fn write_datetime(out: &mut Out, p: &Parts, offset: Option<i64>, opts
     out.push(b'"');
 }
 
-/// Attach `note` to the exception being raised (`exc.add_note(note)`). If
+/// Attaches `note` to the exception being raised (`exc.add_note(note)`). If
 /// that itself fails, its error is cleared and the original exception stands.
 unsafe fn add_note(note: &str) {
     let exc = PyErr_GetRaisedException();
@@ -161,7 +167,7 @@ unsafe fn add_note(note: &str) {
     PyErr_SetRaisedException(exc);
 }
 
-/// `None` → `None`; a timedelta → its total µs. Consumes the reference.
+/// Returns a timedelta's total µs, or `None` for `None`; it consumes the reference.
 unsafe fn delta_us(r: *mut PyObject) -> Option<i64> {
     let out = if r == Py_None() {
         None
@@ -175,12 +181,10 @@ unsafe fn delta_us(r: *mut PyObject) -> Option<i64> {
     out
 }
 
-/// An exact `str`, `int`, `float`, `bool` or `None`: serializing it reads the
-/// object's own data and never runs Python code (no `__index__`, `__float__`,
-/// `utcoffset()` or `default`), so nothing can mutate the container holding
-/// it meanwhile, and the FR-13 guard needn't hold a reference to it (or to its
-/// dict key). Holding one costs a refcount write to every leaf, which on
-/// x86_64 made a list of 100k floats ~40% slower.
+/// Returns whether `obj` is an exact `str`, `int`, `float`, `bool` or `None`,
+/// whose serialization never runs Python, so the guard needn't hold a
+/// reference to it or to its dict key. Holding one costs a refcount write per
+/// leaf, which made a list of 100k floats ~40% slower on x86_64.
 #[inline(always)]
 unsafe fn runs_no_python(obj: *mut PyObject) -> bool {
     let ty = Py_TYPE(obj);
@@ -192,32 +196,32 @@ unsafe fn runs_no_python(obj: *mut PyObject) -> bool {
 }
 
 #[inline]
-pub(crate) fn write_int<I: itoa::Integer>(out: &mut Out, v: I) {
+pub(crate) fn write_int<I: itoa::Integer>(out: &mut OutputBuffer, v: I) {
     let mut b = itoa::Buffer::new();
     crate::float::small_copy(out, b.format(v).as_bytes());
 }
 
-/// Why `invoke_default` produced no object. Both leave an exception set.
-pub(crate) enum DefaultErr {
+/// Both variants leave a Python exception set.
+enum DefaultError {
     /// `MAX_DEFAULT_DEPTH` chained calls.
-    DepthLimit,
+    TooDeep,
     /// `default` itself raised; the exception is the `TypeError`'s cause.
     Raised,
 }
 
 pub(crate) struct Encoder {
-    pub(crate) out: Out,
+    pub(crate) out: OutputBuffer,
     default: *mut PyObject,
     pub(crate) opts: u32,
     pub(crate) depth: u32,
     default_depth: u32,
-    /// This interpreter's type cache (module state).
     pub(crate) cache: *mut TypeCache,
-    /// FR-13: Python code can run during the walk.
+    /// Is set when Python code can run during the walk, so borrowed items must
+    /// be held (FR-13).
     pub(crate) guard: bool,
     /// The datetime group, resolved at the start of `dumps`.
     dt: Option<DtTypes>,
-    /// FR-3's `sys.modules["numpy"]` re-check already ran in this call.
+    /// Records that this call already re-checked `sys.modules["numpy"]`.
     np_rechecked: bool,
 }
 
@@ -282,8 +286,8 @@ impl Encoder {
         self.serialize_other(obj, ty)
     }
 
-    /// Everything past the exact builtins: datetimes, subclasses, numpy and
-    /// `default`, out of line so `serialize` stays as small as 0.1's.
+    /// Handles everything past the exact builtins: datetimes, subclasses, numpy
+    /// and `default`. It is out of line to keep the hot `serialize` small.
     #[inline(never)]
     unsafe fn serialize_other(&mut self, obj: *mut PyObject, ty: *mut PyTypeObject) -> bool {
         if let Some(dt) = self.dt {
@@ -311,7 +315,7 @@ impl Encoder {
         if self.dt.is_none() && self.guard && self.opts & OPT_PASSTHROUGH_DATETIME == 0 {
             match (*self.cache).datetime() {
                 Ok(dt) => self.dt = dt,
-                Err(PyErrSet) => return false,
+                Err(PendingPyErr) => return false,
             }
             if let Some(dt) = self.dt {
                 if let Some(ok) = self.datetime_like(obj, ty, dt) {
@@ -331,7 +335,7 @@ impl Encoder {
                 None => Ok(None),
             };
             match np {
-                Err(PyErrSet) => return false,
+                Err(PendingPyErr) => return false,
                 Ok(Some(np)) => {
                     let outcome = if ty == np.ndarray {
                         Some(crate::numpy::serialize_array(self, obj))
@@ -340,7 +344,7 @@ impl Encoder {
                     };
                     match outcome {
                         Some(Outcome::Written) => return true,
-                        Some(Outcome::Error(PyErrSet)) => return false,
+                        Some(Outcome::Error(PendingPyErr)) => return false,
                         Some(Outcome::Declined(reason)) => {
                             return self.call_default_declined(obj, reason)
                         }
@@ -354,9 +358,9 @@ impl Encoder {
         self.call_default(obj)
     }
 
-    /// Exact `datetime` / `date` / `time`: `Some(ok)` once written (or
-    /// failed); `None` if `obj` is none of them or `PASSTHROUGH_DATETIME`
-    /// sends them to `default`.
+    /// Writes an exact `datetime`, `date` or `time` and returns `Some(ok)`;
+    /// returns `None` if `obj` is none of them or `PASSTHROUGH_DATETIME` sends
+    /// them to `default`.
     #[inline]
     unsafe fn datetime_like(
         &mut self,
@@ -378,7 +382,7 @@ impl Encoder {
         }
     }
 
-    /// Serialize a borrowed container item. With `guard` false no Python code
+    /// Serializes a borrowed container item. With `guard` false no Python code
     /// can run during serialization, so the container cannot be mutated and
     /// the borrow is safe as is. With it set, that code could mutate the
     /// container and drop the item, so hold a reference across the call —
@@ -394,15 +398,11 @@ impl Encoder {
         ok
     }
 
-    /// Call `default(obj)`. Only reached when a `default` was given.
-    pub(crate) unsafe fn invoke_default(
-        &mut self,
-        obj: *mut PyObject,
-    ) -> Result<*mut PyObject, DefaultErr> {
+    unsafe fn invoke_default(&mut self, obj: *mut PyObject) -> Result<*mut PyObject, DefaultError> {
         debug_assert!(!self.default.is_null());
         if self.default_depth >= MAX_DEFAULT_DEPTH {
             raise_type_error("default serializer exceeds recursion limit");
-            return Err(DefaultErr::DepthLimit);
+            return Err(DefaultError::TooDeep);
         }
         debug_assert!(self.guard);
         let r = PyObject_CallOneArg(self.default, obj);
@@ -411,12 +411,12 @@ impl Encoder {
                 "Type is not JSON serializable: {}",
                 type_name(obj)
             ));
-            return Err(DefaultErr::Raised);
+            return Err(DefaultError::Raised);
         }
         Ok(r)
     }
 
-    /// Serialize what `default` returned, and release it.
+    /// Serializes what `default` returned and consumes the reference.
     unsafe fn serialize_default_result(&mut self, r: *mut PyObject) -> bool {
         self.default_depth += 1;
         let ok = self.serialize(r);
@@ -435,49 +435,42 @@ impl Encoder {
         }
         match self.invoke_default(obj) {
             Ok(r) => self.serialize_default_result(r),
-            Err(DefaultErr::DepthLimit | DefaultErr::Raised) => false,
+            Err(DefaultError::TooDeep | DefaultError::Raised) => false,
         }
     }
 
-    /// A numpy object isojson declined (FR-7): the whole object goes to
-    /// `default` when one is given. Without one, the reason's message is
-    /// raised. Either way, when an error results from the decline itself or
-    /// from `default` raising, `reason_note` is attached with `add_note`, so
-    /// the evidence isn't lost. `DepthLimit` gets no note.
+    /// Sends a numpy object isojson declined to `default` whole, or raises the
+    /// decline's message when there is no `default`. When the error comes from
+    /// the decline itself or from `default` raising, `decline_note` is attached
+    /// with `add_note` so the evidence isn't lost; `TooDeep` gets no note.
     pub(crate) unsafe fn call_default_declined(
         &mut self,
         obj: *mut PyObject,
-        reason: Reason,
+        reason: Decline,
     ) -> bool {
         if self.default.is_null() {
-            raise_type_error(&reason_message(&reason));
-            add_note(&reason_note(&reason));
+            raise_type_error(&decline_message(&reason));
+            add_note(&decline_note(&reason));
             return false;
         }
         match self.invoke_default(obj) {
             Ok(r) => self.serialize_default_result(r),
-            Err(DefaultErr::Raised) => {
-                add_note(&reason_note(&reason));
+            Err(DefaultError::Raised) => {
+                add_note(&decline_note(&reason));
                 false
             }
-            Err(DefaultErr::DepthLimit) => false,
+            Err(DefaultError::TooDeep) => false,
         }
     }
 
-    /// `obj.utcoffset()` as total µs; `None` when naive (design §1a). The
-    /// tzinfo field is read first, so naive objects call no method (D7).
+    /// Returns `obj.utcoffset()` as total µs, or `None` when `obj` is naive;
+    /// a naive object calls no method.
     ///
-    /// This is CPython's own `call_tzinfo_method` done inline:
-    /// `tzinfo.utcoffset(arg)` (`arg` is the datetime, or `None` for a
-    /// `time`), then `None` passes, and a timedelta (or subclass) must lie
-    /// strictly between −24 h and 24 h. `datetime.utcoffset()` builds that call
-    /// from a format string, which costs about 40 ns per value.
-    ///
-    /// A raising tzinfo is exactly what `obj.utcoffset()` would propagate;
-    /// it becomes DV-4b's `TypeError`, with the exception as `__cause__`. For
-    /// an invalid result (DV-15), `obj.utcoffset()` itself is asked, so the
-    /// error is CPython's own, word for word; that path calls the tzinfo a
-    /// second time.
+    /// This is CPython's `call_tzinfo_method` done inline, because
+    /// `datetime.utcoffset()` builds the call from a format string, which
+    /// costs about 40 ns per value. A raising tzinfo becomes a `TypeError` with
+    /// the exception as `__cause__`. An invalid result asks `obj.utcoffset()`
+    /// itself, so the error is CPython's own, word for word.
     unsafe fn utcoffset_of(
         &mut self,
         obj: *mut PyObject,
@@ -485,7 +478,7 @@ impl Encoder {
         arg: *mut PyObject,
         what: &str,
         delta: *mut PyTypeObject,
-    ) -> R<Option<i64>> {
+    ) -> PyResult<Option<i64>> {
         if tzinfo == Py_None() {
             return Ok(None);
         }
@@ -519,26 +512,26 @@ impl Encoder {
         Ok(delta_us(r))
     }
 
-    /// DV-4b: `TypeError("<what>.utcoffset() raised <Exc>: <msg>")` from the
-    /// exception being raised, which becomes its `__cause__`.
-    unsafe fn utcoffset_raised(&mut self, what: &str) -> PyErrSet {
+    /// Raises `TypeError("<what>.utcoffset() raised <Exc>: <msg>")` with the
+    /// pending exception as its `__cause__`.
+    unsafe fn utcoffset_raised(&mut self, what: &str) -> PendingPyErr {
         let cause = PyErr_GetRaisedException();
         let msg = format!("{what}.utcoffset() raised {}", describe_exception(cause));
         raise_type_error_caused_by(&msg, cause);
-        PyErrSet
+        PendingPyErr
     }
 
-    /// `dt.isoformat()` after `NAIVE_UTC` / `OMIT_MICROSECONDS`, with a zero
-    /// offset written `Z` under `UTC_Z` (design §1a, FR-5).
+    /// Writes `dt.isoformat()` after `NAIVE_UTC` and `OMIT_MICROSECONDS`, with a
+    /// zero offset written `Z` under `UTC_Z`.
     unsafe fn datetime(&mut self, obj: *mut PyObject, dt: DtTypes) -> bool {
         let tzinfo = PyDateTime_DATE_GET_TZINFO(obj);
         let offset = match self.utcoffset_of(obj, tzinfo, obj, "datetime", dt.delta) {
             Ok(Some(o)) => Some(o),
             Ok(None) if self.opts & OPT_NAIVE_UTC != 0 => Some(0),
             Ok(None) => None,
-            Err(PyErrSet) => return false,
+            Err(PendingPyErr) => return false,
         };
-        let p = Parts {
+        let p = DateTimeParts {
             y: PyDateTime_GET_YEAR(obj) as u16,
             mo: PyDateTime_GET_MONTH(obj) as u8,
             d: PyDateTime_GET_DAY(obj) as u8,
@@ -551,7 +544,7 @@ impl Encoder {
         true
     }
 
-    /// `d.isoformat()`. No options apply.
+    /// Writes `d.isoformat()`; no options apply.
     unsafe fn date(&mut self, obj: *mut PyObject) -> bool {
         self.out.push(b'"');
         write_ymd(
@@ -564,14 +557,14 @@ impl Encoder {
         true
     }
 
-    /// `t.isoformat()` after `OMIT_MICROSECONDS`, with its offset if it has
-    /// one (DV-12). `NAIVE_UTC` and `UTC_Z` don't apply to `time`.
+    /// Writes `t.isoformat()` after `OMIT_MICROSECONDS`, with its offset if it
+    /// has one; `NAIVE_UTC` and `UTC_Z` don't apply to `time`.
     unsafe fn time(&mut self, obj: *mut PyObject, dt: DtTypes) -> bool {
         let opts = self.opts & !(OPT_NAIVE_UTC | OPT_UTC_Z);
         let tzinfo = PyDateTime_TIME_GET_TZINFO(obj);
         let offset = match self.utcoffset_of(obj, tzinfo, Py_None(), "time", dt.delta) {
             Ok(o) => o,
-            Err(PyErrSet) => return false,
+            Err(PendingPyErr) => return false,
         };
         self.out.push(b'"');
         let mut b = [0u8; 15];
@@ -829,7 +822,7 @@ impl Encoder {
     }
 }
 
-/// Copy bytes of `s` from `i` to `dst` until the first byte that needs
+/// Copies bytes of `s` from `i` to `dst` until the first byte that needs
 /// escaping (or the end). Returns its index; `dst` is advanced past the copied
 /// bytes. May store up to 15 bytes beyond what it reports as copied, so the
 /// caller must have 16 bytes of slack.
@@ -913,7 +906,7 @@ unsafe fn copy_plain(s: &[u8], mut i: usize, dst: &mut *mut u8) -> usize {
 }
 
 #[inline]
-fn write_escaped(out: &mut Out, s: &[u8]) {
+fn write_escaped(out: &mut OutputBuffer, s: &[u8]) {
     let n = s.len();
     // 2 quotes + 16 bytes of slack for copy_plain's full-width stores
     out.reserve(n + 2 + 16);
@@ -1042,11 +1035,11 @@ pub(crate) unsafe extern "C" fn dumps(
     let cache = &raw mut (*state(module)).types;
     let dt = match (*cache).datetime() {
         Ok(dt) => dt,
-        Err(PyErrSet) => return ptr::null_mut(),
+        Err(PendingPyErr) => return ptr::null_mut(),
     };
     let guard = !default.is_null() || opts & OPT_SERIALIZE_NUMPY != 0 || dt.is_some();
 
-    let Some(out) = Out::new() else {
+    let Some(out) = OutputBuffer::new() else {
         return ptr::null_mut();
     };
     let mut enc = Encoder {

@@ -1,4 +1,4 @@
-//! Reading a `str`'s UTF-8 without a function call.
+//! Reads a `str`'s UTF-8 without a function call.
 //!
 //! CPython does not expose this in its public API, so this module mirrors the
 //! object header layout of CPython 3.14 (GIL builds): a compact ASCII
@@ -20,7 +20,7 @@ use pyo3_ffi::*;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
-struct AsciiObject {
+struct PyASCIIObject {
     ob_base: PyObject,
     length: Py_ssize_t,
     hash: Py_hash_t,
@@ -28,8 +28,8 @@ struct AsciiObject {
 }
 
 #[repr(C)]
-struct CompactUnicodeObject {
-    base: AsciiObject,
+struct PyCompactUnicodeObject {
+    base: PyASCIIObject,
     utf8_length: Py_ssize_t,
     utf8: *const u8,
 }
@@ -38,7 +38,7 @@ struct CompactUnicodeObject {
 const COMPACT: u32 = 1 << 5;
 const ASCII: u32 = 1 << 6;
 
-/// UTF-8 of an exact or subclass `str` if it is available without a call:
+/// Returns the UTF-8 of an exact or subclass `str` if it is available without a call:
 /// compact ASCII, or compact non-ASCII whose UTF-8 is already cached.
 #[inline(always)]
 pub(crate) unsafe fn utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
@@ -56,19 +56,19 @@ pub(crate) unsafe fn utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
     }
 }
 
-/// The layout read itself, without the ENABLED gate (used by `self_check`).
+/// Reads the layout directly, without the `ENABLED` gate; `self_check` uses it.
 #[cfg(not(Py_GIL_DISABLED))]
 #[inline(always)]
 unsafe fn layout_utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
     {
-        let a = op.cast::<AsciiObject>();
+        let a = op.cast::<PyASCIIObject>();
         let st = (*a).state;
         if st & (COMPACT | ASCII) == (COMPACT | ASCII) {
-            let data = op.cast::<u8>().add(core::mem::size_of::<AsciiObject>());
+            let data = op.cast::<u8>().add(core::mem::size_of::<PyASCIIObject>());
             return Some(core::slice::from_raw_parts(data, (*a).length as usize));
         }
         if st & COMPACT != 0 {
-            let c = op.cast::<CompactUnicodeObject>();
+            let c = op.cast::<PyCompactUnicodeObject>();
             if !(*c).utf8.is_null() {
                 return Some(core::slice::from_raw_parts(
                     (*c).utf8,
@@ -80,9 +80,9 @@ unsafe fn layout_utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
     }
 }
 
-/// UTF-8 of a `str`: fast path, else `PyUnicode_AsUTF8AndSize` (which also
-/// caches it on the object). `None` = not encodable (lone surrogates); the
-/// Python error is cleared.
+/// Returns the UTF-8 of a `str` from the fast path, else from
+/// `PyUnicode_AsUTF8AndSize`, which allocates a copy and keeps it on the object.
+/// `None` means it is not encodable (lone surrogates); the error is cleared.
 #[inline(always)]
 pub(crate) unsafe fn as_utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
     if let Some(b) = utf8(op) {
@@ -97,7 +97,7 @@ pub(crate) unsafe fn as_utf8<'a>(op: *mut PyObject) -> Option<&'a [u8]> {
     Some(core::slice::from_raw_parts(p.cast(), len as usize))
 }
 
-/// Enable the fast path iff it agrees with the public API on every probe.
+/// Enables the fast path iff it agrees with the public API on every probe.
 /// Returns -1 only if creating a probe string fails (Python error set).
 pub(crate) unsafe fn self_check() -> core::ffi::c_int {
     #[cfg(Py_GIL_DISABLED)]
@@ -128,7 +128,7 @@ pub(crate) unsafe fn self_check() -> core::ffi::c_int {
             let fast = layout_utf8(o);
             let expect_ascii = p.to_bytes().is_ascii();
             let is_ascii_bits =
-                (*o.cast::<AsciiObject>()).state & (COMPACT | ASCII) == (COMPACT | ASCII);
+                (*o.cast::<PyASCIIObject>()).state & (COMPACT | ASCII) == (COMPACT | ASCII);
             ok &= match fast {
                 Some(b) => {
                     !api.is_null()
@@ -148,7 +148,7 @@ pub(crate) unsafe fn self_check() -> core::ffi::c_int {
     }
 }
 
-/// For tests: whether the fast path is active in this process.
+/// Returns whether the fast path is active in this process; only tests read it.
 pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }

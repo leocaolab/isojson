@@ -3,7 +3,7 @@
 Every case (a)–(f): with a `default` it receives the whole original object;
 without one, the exact FR-7 message; with a raising `default`, orjson's
 message with `default`'s exception as the cause. In both raising cases the
-note is `reason_note`'s text, whose exact form is pinned by the Rust tests
+note is `decline_note`'s text, whose exact form is pinned by the Rust tests
 (C6); here it must name the evidence.
 """
 

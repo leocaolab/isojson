@@ -1,24 +1,24 @@
 //! Tests for the decline rule (design C6): `classify` in orjson's order, and
-//! `reason_message` / `reason_note` for every `Reason`.
+//! `decline_message` / `decline_note` for every `Decline`.
 
 use super::*;
 
 const OK_FLAGS: i32 = C_CONTIGUOUS | NOTSWAPPED;
 
-const TABLE: &[(u8, i32, Elem)] = &[
-    (b'b', 1, Elem::Bool),
-    (b'f', 2, Elem::F16),
-    (b'f', 4, Elem::F32),
-    (b'f', 8, Elem::F64),
-    (b'i', 1, Elem::I8),
-    (b'i', 2, Elem::I16),
-    (b'i', 4, Elem::I32),
-    (b'i', 8, Elem::I64),
-    (b'u', 1, Elem::U8),
-    (b'u', 2, Elem::U16),
-    (b'u', 4, Elem::U32),
-    (b'u', 8, Elem::U64),
-    (b'M', 8, Elem::Dt64),
+const TABLE: &[(u8, i32, ElementType)] = &[
+    (b'b', 1, ElementType::Bool),
+    (b'f', 2, ElementType::F16),
+    (b'f', 4, ElementType::F32),
+    (b'f', 8, ElementType::F64),
+    (b'i', 1, ElementType::I8),
+    (b'i', 2, ElementType::I16),
+    (b'i', 4, ElementType::I32),
+    (b'i', 8, ElementType::I64),
+    (b'u', 1, ElementType::U8),
+    (b'u', 2, ElementType::U16),
+    (b'u', 4, ElementType::U32),
+    (b'u', 8, ElementType::U64),
+    (b'M', 8, ElementType::Dt64),
 ];
 
 #[test]
@@ -29,7 +29,7 @@ fn classify_accepts_exactly_the_table() {
                 .iter()
                 .find(|&&(k, n, _)| k == kind && n == itemsize)
                 .map(|&(_, _, e)| e)
-                .ok_or(Check::Dtype);
+                .ok_or(ArrayDecline::UnsupportedDtype);
             for nd in [1, 2, 64] {
                 assert_eq!(
                     classify(OK_FLAGS, nd, kind, itemsize),
@@ -50,7 +50,10 @@ fn classify_accepts_exactly_the_table() {
         (b'V', 8),
         (b'f', 16),
     ] {
-        assert_eq!(classify(OK_FLAGS, 1, kind, itemsize), Err(Check::Dtype));
+        assert_eq!(
+            classify(OK_FLAGS, 1, kind, itemsize),
+            Err(ArrayDecline::UnsupportedDtype)
+        );
     }
 }
 
@@ -58,124 +61,139 @@ fn classify_accepts_exactly_the_table() {
 fn classify_order_first_match_wins() {
     let bad = (b'c', 16);
     // (a) before everything
-    assert_eq!(classify(0, 0, bad.0, bad.1), Err(Check::NotContiguous));
-    assert_eq!(classify(NOTSWAPPED, 1, b'f', 8), Err(Check::NotContiguous));
+    assert_eq!(
+        classify(0, 0, bad.0, bad.1),
+        Err(ArrayDecline::NotContiguous)
+    );
+    assert_eq!(
+        classify(NOTSWAPPED, 1, b'f', 8),
+        Err(ArrayDecline::NotContiguous)
+    );
     // (b) before (c) and (d)
     assert_eq!(
         classify(C_CONTIGUOUS, 0, bad.0, bad.1),
-        Err(Check::NotNative)
+        Err(ArrayDecline::NotNative)
     );
-    assert_eq!(classify(C_CONTIGUOUS, 1, b'f', 8), Err(Check::NotNative));
+    assert_eq!(
+        classify(C_CONTIGUOUS, 1, b'f', 8),
+        Err(ArrayDecline::NotNative)
+    );
     // (c) before (d)
-    assert_eq!(classify(OK_FLAGS, 0, bad.0, bad.1), Err(Check::ZeroDim));
-    assert_eq!(classify(OK_FLAGS, 0, b'f', 8), Err(Check::ZeroDim));
+    assert_eq!(
+        classify(OK_FLAGS, 0, bad.0, bad.1),
+        Err(ArrayDecline::ZeroDim)
+    );
+    assert_eq!(classify(OK_FLAGS, 0, b'f', 8), Err(ArrayDecline::ZeroDim));
     // (d)
-    assert_eq!(classify(OK_FLAGS, 1, bad.0, bad.1), Err(Check::Dtype));
+    assert_eq!(
+        classify(OK_FLAGS, 1, bad.0, bad.1),
+        Err(ArrayDecline::UnsupportedDtype)
+    );
 }
 
 #[test]
 fn classify_ignores_other_flag_bits() {
     // ALIGNED 0x100, WRITEABLE 0x400, F_CONTIGUOUS 0x2, OWNDATA 0x4
     let extra = 0x100 | 0x400 | 0x2 | 0x4;
-    assert_eq!(classify(OK_FLAGS | extra, 2, b'i', 8), Ok(Elem::I64));
+    assert_eq!(classify(OK_FLAGS | extra, 2, b'i', 8), Ok(ElementType::I64));
     assert_eq!(
         classify(NOTSWAPPED | extra, 2, b'i', 8),
-        Err(Check::NotContiguous)
+        Err(ArrayDecline::NotContiguous)
     );
 }
 
 #[test]
 fn classify_negative_nd_is_not_walked() {
-    assert_eq!(classify(OK_FLAGS, -1, b'f', 8), Err(Check::ZeroDim));
+    assert_eq!(classify(OK_FLAGS, -1, b'f', 8), Err(ArrayDecline::ZeroDim));
 }
 
-fn u(base: Unit, mult: i64) -> Dt64Unit {
+fn u(base: TimeUnit, mult: i64) -> Dt64Unit {
     Dt64Unit { base, mult }
 }
 
 #[test]
 fn messages_match_fr7() {
-    let cases: Vec<(Reason, &str)> = vec![
+    let cases: Vec<(Decline, &str)> = vec![
         (
-            Reason::NotContiguous {
+            Decline::NotContiguous {
                 flags: 0x502,
                 shape: vec![3, 2],
             },
             "numpy array is not C contiguous; use ndarray.tolist() in default",
         ),
         (
-            Reason::NotNative {
+            Decline::NotNative {
                 dtype: b">f8".to_vec(),
             },
             "numpy array is not native-endianness",
         ),
         (
-            Reason::ZeroDim {
+            Decline::ZeroDim {
                 dtype: b"<f8".to_vec(),
             },
             "unsupported datatype in numpy array",
         ),
         (
-            Reason::Dtype {
+            Decline::UnsupportedDtype {
                 dtype: b"<U3".to_vec(),
             },
             "unsupported datatype in numpy array",
         ),
         (
-            Reason::GenericValue { v: 5 },
+            Decline::GenericUnit { v: 5 },
             "unsupported numpy.datetime64 unit: generic",
         ),
         (
-            Reason::UnparseableDtype {
+            Decline::UnparseableDtype {
                 dtype: b"<M8[xx]".to_vec(),
             },
             "unsupported numpy.datetime64 dtype: <M8[xx]",
         ),
         (
-            Reason::Unrepresentable {
+            Decline::Unrepresentable {
                 v: 307_445_734_561_825_861,
-                unit: u(Unit::Minute, 1),
+                unit: u(TimeUnit::Minute, 1),
             },
             "unrepresentable numpy.datetime64: 307445734561825861 minutes",
         ),
         (
-            Reason::Unrepresentable {
+            Decline::Unrepresentable {
                 v: -5,
-                unit: u(Unit::Milli, 10),
+                unit: u(TimeUnit::Milli, 10),
             },
             "unrepresentable numpy.datetime64: -5 milliseconds × 10",
         ),
     ];
     for (r, want) in cases {
-        assert_eq!(reason_message(&r), want, "{r:?}");
+        assert_eq!(decline_message(&r), want, "{r:?}");
     }
 }
 
 #[test]
 fn unrepresentable_names_every_unit_as_orjson() {
     let words = [
-        (Unit::Year, "years"),
-        (Unit::Month, "months"),
-        (Unit::Week, "weeks"),
-        (Unit::Day, "days"),
-        (Unit::Hour, "hours"),
-        (Unit::Minute, "minutes"),
-        (Unit::Second, "seconds"),
-        (Unit::Milli, "milliseconds"),
-        (Unit::Micro, "microseconds"),
-        (Unit::Nano, "nanoseconds"),
-        (Unit::Pico, "picoseconds"),
-        (Unit::Femto, "femtoseconds"),
-        (Unit::Atto, "attoseconds"),
-        (Unit::Generic, "generic"),
+        (TimeUnit::Year, "years"),
+        (TimeUnit::Month, "months"),
+        (TimeUnit::Week, "weeks"),
+        (TimeUnit::Day, "days"),
+        (TimeUnit::Hour, "hours"),
+        (TimeUnit::Minute, "minutes"),
+        (TimeUnit::Second, "seconds"),
+        (TimeUnit::Milli, "milliseconds"),
+        (TimeUnit::Micro, "microseconds"),
+        (TimeUnit::Nano, "nanoseconds"),
+        (TimeUnit::Pico, "picoseconds"),
+        (TimeUnit::Femto, "femtoseconds"),
+        (TimeUnit::Atto, "attoseconds"),
+        (TimeUnit::Generic, "generic"),
     ];
     for (base, word) in words {
-        let r = Reason::Unrepresentable {
+        let r = Decline::Unrepresentable {
             v: 1,
             unit: u(base, 1),
         };
         assert_eq!(
-            reason_message(&r),
+            decline_message(&r),
             format!("unrepresentable numpy.datetime64: 1 {word}")
         );
     }
@@ -183,9 +201,9 @@ fn unrepresentable_names_every_unit_as_orjson() {
 
 #[test]
 fn notes_carry_the_raw_evidence() {
-    let cases: Vec<(Reason, &str)> = vec![
+    let cases: Vec<(Decline, &str)> = vec![
         (
-            Reason::NotContiguous {
+            Decline::NotContiguous {
                 flags: 0x502,
                 shape: vec![3, 2],
             },
@@ -193,7 +211,7 @@ fn notes_carry_the_raw_evidence() {
              (flags=0x502, shape=(3, 2))",
         ),
         (
-            Reason::NotContiguous {
+            Decline::NotContiguous {
                 flags: 0x0,
                 shape: vec![7],
             },
@@ -201,38 +219,38 @@ fn notes_carry_the_raw_evidence() {
              (flags=0x0, shape=(7,))",
         ),
         (
-            Reason::NotNative {
+            Decline::NotNative {
                 dtype: b">f8".to_vec(),
             },
             "numpy array is not native-endianness (dtype.str='>f8')",
         ),
         (
-            Reason::ZeroDim {
+            Decline::ZeroDim {
                 dtype: b"<f8".to_vec(),
             },
             "unsupported datatype in numpy array (0-d array, dtype.str='<f8')",
         ),
         (
-            Reason::Dtype {
+            Decline::UnsupportedDtype {
                 dtype: b"<U3".to_vec(),
             },
             "unsupported datatype in numpy array (dtype.str='<U3')",
         ),
         (
-            Reason::GenericValue { v: 5 },
+            Decline::GenericUnit { v: 5 },
             "unsupported numpy.datetime64 unit: generic (value=5; a generic-unit \
              datetime64 has no unit, so its value has no meaning)",
         ),
         (
-            Reason::UnparseableDtype {
+            Decline::UnparseableDtype {
                 dtype: b"<M8[xx]".to_vec(),
             },
             "unsupported numpy.datetime64 dtype: <M8[xx]",
         ),
         (
-            Reason::Unrepresentable {
+            Decline::Unrepresentable {
                 v: -5,
-                unit: u(Unit::Milli, 10),
+                unit: u(TimeUnit::Milli, 10),
             },
             "unrepresentable numpy.datetime64: -5 milliseconds × 10 (outside \
              0000-01-01T00:00:00 … 9999-12-31T23:59:59.999999)",
@@ -240,7 +258,7 @@ fn notes_carry_the_raw_evidence() {
     ];
     for (r, want) in cases {
         assert_eq!(
-            reason_note(&r),
+            decline_note(&r),
             format!("isojson can't write this numpy object natively: {want}"),
             "{r:?}"
         );
@@ -249,8 +267,8 @@ fn notes_carry_the_raw_evidence() {
 
 #[test]
 fn non_utf8_dtype_is_shown_not_dropped() {
-    let r = Reason::Dtype {
+    let r = Decline::UnsupportedDtype {
         dtype: vec![b'<', 0xff, b'8'],
     };
-    assert!(reason_note(&r).contains("dtype.str='<\u{fffd}8'"));
+    assert!(decline_note(&r).contains("dtype.str='<\u{fffd}8'"));
 }

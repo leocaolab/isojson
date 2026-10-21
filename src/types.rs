@@ -1,4 +1,4 @@
-//! Per-interpreter type cache (design C1, FR-1…3).
+//! Caches, per interpreter, the datetime and numpy types isojson recognizes.
 //!
 //! Types isojson recognizes beyond the builtins are looked up in the calling
 //! interpreter's `sys.modules`, never imported, and cached in that
@@ -13,7 +13,7 @@ use core::ffi::{c_int, c_void, CStr};
 use core::ptr;
 use pyo3_ffi::*;
 
-use crate::{PyErrSet, R};
+use crate::{PendingPyErr, PyResult};
 
 /// The datetime group: `_datetime`'s C types, which are static, shared by
 /// every interpreter and immortal, so reference counting them from
@@ -31,8 +31,8 @@ pub(crate) struct DtTypes {
 /// read from the current interpreter's own numpy. Strong references, so a
 /// cached pointer can't be reused by another object.
 ///
-/// A copy must be re-fetched after any call that can run Python: a nested
-/// `dumps` may replace the group (C1's review-enforced invariant).
+/// A copy must be re-fetched after any call that can run Python, because a
+/// nested `dumps` may replace the group.
 #[derive(Clone, Copy)]
 pub(crate) struct NumpyTypes {
     pub(crate) ndarray: *mut PyTypeObject,
@@ -51,7 +51,7 @@ pub(crate) struct NumpyTypes {
     pub(crate) datetime64: *mut PyTypeObject,
 }
 
-/// The numpy names, in `NumpyTypes::all` order.
+/// The numpy attribute names, which must stay in `NumpyTypes::all` order.
 const NUMPY_NAMES: [&CStr; 14] = [
     c"ndarray",
     c"float64",
@@ -115,9 +115,9 @@ impl NumpyTypes {
     }
 }
 
-/// The interned names, created in `init`.
+/// Names interned once in `TypeCache::init`, so lookups never build a string.
 #[repr(C)]
-pub(crate) struct Names {
+pub(crate) struct InternedNames {
     pub(crate) datetime_mod: *mut PyObject,
     pub(crate) numpy: *mut PyObject,
     pub(crate) datetime_capi: *mut PyObject,
@@ -127,7 +127,7 @@ pub(crate) struct Names {
     pub(crate) str: *mut PyObject,
 }
 
-impl Names {
+impl InternedNames {
     fn slots(&mut self) -> [(&mut *mut PyObject, &'static CStr); 7] {
         [
             (&mut self.datetime_mod, c"_datetime"),
@@ -149,20 +149,19 @@ pub(crate) struct TypeCache {
     /// Owner of the numpy group: the `sys.modules["numpy"]` it was read from.
     np_module: *mut PyObject,
     np: NumpyTypes,
-    pub(crate) names: Names,
+    pub(crate) names: InternedNames,
 }
 
-/// `d[key]` as a strong reference; `Ok(None)` if missing.
-unsafe fn get_item(d: *mut PyObject, key: *mut PyObject) -> R<Option<*mut PyObject>> {
+/// Returns `d[key]` as a strong reference, or `None` when the key is missing.
+unsafe fn get_item(d: *mut PyObject, key: *mut PyObject) -> PyResult<Option<*mut PyObject>> {
     let mut v = ptr::null_mut();
     match PyDict_GetItemRef(d, key, &mut v) {
         1 => Ok(Some(v)),
         0 => Ok(None),
-        _ => Err(PyErrSet),
+        _ => Err(PendingPyErr),
     }
 }
 
-/// Release a strong reference held in `slot`, leaving it null.
 unsafe fn release<T>(slot: &mut *mut T) {
     let p = core::mem::replace(slot, ptr::null_mut());
     if !p.is_null() {
@@ -178,7 +177,7 @@ unsafe fn release_all(np: &mut NumpyTypes) {
 }
 
 impl TypeCache {
-    /// Create the interned names. Called from `module_exec`.
+    /// Returns -1 with a Python error set if interning a name fails.
     pub(crate) unsafe fn init(&mut self) -> c_int {
         for (slot, name) in self.names.slots() {
             let s = PyUnicode_InternFromString(name.as_ptr());
@@ -190,11 +189,11 @@ impl TypeCache {
         0
     }
 
-    /// The datetime group, loaded on first use (design §8.1). Absent when
+    /// Returns the datetime group, loading it on first use. It is `None` while
     /// `_datetime` is not in `sys.modules`, is not a module, or has no valid
-    /// `datetime_CAPI` capsule; retried on the next call.
+    /// `datetime_CAPI` capsule, and the load is retried on the next call.
     #[inline(always)]
-    pub(crate) unsafe fn datetime(&mut self) -> R<Option<DtTypes>> {
+    pub(crate) unsafe fn datetime(&mut self) -> PyResult<Option<DtTypes>> {
         if !self.dt_capsule.is_null() {
             return Ok(Some(self.dt));
         }
@@ -203,7 +202,7 @@ impl TypeCache {
 
     #[cold]
     #[inline(never)]
-    unsafe fn load_datetime(&mut self) -> R<Option<DtTypes>> {
+    unsafe fn load_datetime(&mut self) -> PyResult<Option<DtTypes>> {
         if self.names.datetime_mod.is_null() {
             return Ok(None);
         }
@@ -241,18 +240,18 @@ impl TypeCache {
         Ok(Some(dt))
     }
 
-    /// The cached numpy group if `ty` is one of its types; no lookup.
+    /// Returns the cached numpy group if `ty` is one of its types, without a lookup.
     #[inline(always)]
     pub(crate) fn numpy_hit(&self, ty: *mut PyTypeObject) -> Option<NumpyTypes> {
         (!self.np_module.is_null() && self.np.contains(ty)).then_some(self.np)
     }
 
-    /// The numpy group if `ty` is one of its types (design §8.1, FR-3).
+    /// Returns the numpy group if `ty` is one of its types.
     ///
     /// A hit is trusted. On a miss, the group is re-read only if
     /// `sys.modules["numpy"]` is no longer the module it was read from; if
-    /// numpy is absent, not a module, or lacks a name, the group is Absent.
-    pub(crate) unsafe fn numpy(&mut self, ty: *mut PyTypeObject) -> R<Option<NumpyTypes>> {
+    /// numpy is absent, not a module, or lacks a name, the result is `None`.
+    pub(crate) unsafe fn numpy(&mut self, ty: *mut PyTypeObject) -> PyResult<Option<NumpyTypes>> {
         if let Some(np) = self.numpy_hit(ty) {
             return Ok(Some(np));
         }
@@ -276,7 +275,7 @@ impl TypeCache {
         for (slot, name) in types.iter_mut().zip(NUMPY_NAMES) {
             let key = PyUnicode_InternFromString(name.as_ptr());
             let v = if key.is_null() {
-                Err(PyErrSet)
+                Err(PendingPyErr)
             } else {
                 let v = get_item(d, key);
                 Py_DECREF(key);
@@ -284,7 +283,7 @@ impl TypeCache {
             };
             match v {
                 Ok(Some(t)) => *slot = t.cast(),
-                Ok(None) | Err(PyErrSet) => {
+                Ok(None) | Err(PendingPyErr) => {
                     for t in types.iter_mut() {
                         release(t);
                     }
@@ -339,7 +338,7 @@ impl TypeCache {
         0
     }
 
-    /// Release the groups and the names. A zeroed cache is left as it is.
+    /// Releases the groups and the names; on a zeroed cache it does nothing.
     pub(crate) unsafe fn clear(&mut self) {
         release(&mut self.dt_capsule);
         release(&mut self.dt.datetime);
