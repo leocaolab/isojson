@@ -10,9 +10,11 @@
 //! names (before `init`, after `clear`) mean every group stays Absent.
 
 use core::ffi::{c_int, c_void, CStr};
+use core::iter;
 use core::ptr;
 use pyo3_ffi::*;
 
+use crate::decline::ElementType;
 use crate::{PendingPyErr, PyResult};
 
 /// The datetime group: `_datetime`'s C types, which are static, shared by
@@ -27,7 +29,7 @@ pub(crate) struct DtTypes {
     pub(crate) delta: *mut PyTypeObject,
 }
 
-/// The numpy group: `ndarray` and the 13 scalar types isojson writes (FR-8),
+/// The numpy group: `ndarray` and the scalar type of every `ElementType`,
 /// read from the current interpreter's own numpy. Strong references, so a
 /// cached pointer can't be reused by another object.
 ///
@@ -36,82 +38,56 @@ pub(crate) struct DtTypes {
 #[derive(Clone, Copy)]
 pub(crate) struct NumpyTypes {
     pub(crate) ndarray: *mut PyTypeObject,
-    pub(crate) float64: *mut PyTypeObject,
-    pub(crate) float32: *mut PyTypeObject,
-    pub(crate) float16: *mut PyTypeObject,
-    pub(crate) int8: *mut PyTypeObject,
-    pub(crate) int16: *mut PyTypeObject,
-    pub(crate) int32: *mut PyTypeObject,
-    pub(crate) int64: *mut PyTypeObject,
-    pub(crate) uint8: *mut PyTypeObject,
-    pub(crate) uint16: *mut PyTypeObject,
-    pub(crate) uint32: *mut PyTypeObject,
-    pub(crate) uint64: *mut PyTypeObject,
-    pub(crate) bool_: *mut PyTypeObject,
-    pub(crate) datetime64: *mut PyTypeObject,
+    /// Holds the scalar type of each `ElementType`, in `ElementType::ALL` order.
+    scalars: [*mut PyTypeObject; ElementType::ALL.len()],
 }
 
-/// The numpy attribute names, which must stay in `NumpyTypes::all` order.
-const NUMPY_NAMES: [&CStr; 14] = [
-    c"ndarray",
-    c"float64",
-    c"float32",
-    c"float16",
-    c"int8",
-    c"int16",
-    c"int32",
-    c"int64",
-    c"uint8",
-    c"uint16",
-    c"uint32",
-    c"uint64",
-    c"bool_",
-    c"datetime64",
-];
-
 impl NumpyTypes {
-    fn all(&self) -> [*mut PyTypeObject; 14] {
-        [
-            self.ndarray,
-            self.float64,
-            self.float32,
-            self.float16,
-            self.int8,
-            self.int16,
-            self.int32,
-            self.int64,
-            self.uint8,
-            self.uint16,
-            self.uint32,
-            self.uint64,
-            self.bool_,
-            self.datetime64,
-        ]
+    const EMPTY: Self = NumpyTypes {
+        ndarray: ptr::null_mut(),
+        scalars: [ptr::null_mut(); ElementType::ALL.len()],
+    };
+
+    fn all(&self) -> impl Iterator<Item = *mut PyTypeObject> {
+        iter::once(self.ndarray).chain(self.scalars)
     }
 
-    fn from_all(t: [*mut PyTypeObject; 14]) -> Self {
-        let [ndarray, float64, float32, float16, int8, int16, int32, int64, uint8, uint16, uint32, uint64, bool_, datetime64] =
-            t;
-        NumpyTypes {
-            ndarray,
-            float64,
-            float32,
-            float16,
-            int8,
-            int16,
-            int32,
-            int64,
-            uint8,
-            uint16,
-            uint32,
-            uint64,
-            bool_,
-            datetime64,
-        }
+    fn slots(&mut self) -> impl Iterator<Item = (&mut *mut PyTypeObject, &'static CStr)> {
+        iter::once((&mut self.ndarray, c"ndarray")).chain(
+            self.scalars
+                .iter_mut()
+                .zip(ElementType::ALL.map(numpy_name)),
+        )
     }
 
     fn contains(&self, ty: *mut PyTypeObject) -> bool {
-        self.all().contains(&ty)
+        self.ndarray == ty || self.scalars.contains(&ty)
+    }
+
+    /// Returns the element type whose numpy scalar type is `ty`, or `None`.
+    pub(crate) fn scalar(&self, ty: *mut PyTypeObject) -> Option<ElementType> {
+        self.scalars
+            .iter()
+            .zip(ElementType::ALL)
+            .find_map(|(&t, e)| (t == ty).then_some(e))
+    }
+}
+
+fn numpy_name(e: ElementType) -> &'static CStr {
+    match e {
+        ElementType::F64 => c"float64",
+        ElementType::F32 => c"float32",
+        ElementType::F16 => c"float16",
+        ElementType::I64 => c"int64",
+        ElementType::I32 => c"int32",
+        ElementType::I16 => c"int16",
+        ElementType::I8 => c"int8",
+        ElementType::U64 => c"uint64",
+        ElementType::U32 => c"uint32",
+        ElementType::U16 => c"uint16",
+        ElementType::U8 => c"uint8",
+        ElementType::Bool => c"bool_",
+        ElementType::Dt64 => c"datetime64",
     }
 }
 
@@ -170,10 +146,41 @@ unsafe fn release<T>(slot: &mut *mut T) {
 }
 
 unsafe fn release_all(np: &mut NumpyTypes) {
-    for mut t in np.all() {
-        release(&mut t);
+    for (slot, _) in np.slots() {
+        release(slot);
     }
-    *np = NumpyTypes::from_all([ptr::null_mut(); 14]);
+}
+
+/// Reads the numpy group from numpy's module dict; `None` if a name is missing.
+unsafe fn read_numpy(d: *mut PyObject) -> PyResult<Option<NumpyTypes>> {
+    let mut np = NumpyTypes::EMPTY;
+    let mut found = Ok(true);
+    for (slot, name) in np.slots() {
+        match get_named(d, name) {
+            Ok(Some(t)) => *slot = t.cast(),
+            other => {
+                found = other.map(|_| false);
+                break;
+            }
+        }
+    }
+    match found {
+        Ok(true) => Ok(Some(np)),
+        other => {
+            release_all(&mut np);
+            other.map(|_| None)
+        }
+    }
+}
+
+unsafe fn get_named(d: *mut PyObject, name: &CStr) -> PyResult<Option<*mut PyObject>> {
+    let key = PyUnicode_InternFromString(name.as_ptr());
+    if key.is_null() {
+        return Err(PendingPyErr);
+    }
+    let v = get_item(d, key);
+    Py_DECREF(key);
+    v
 }
 
 impl TypeCache {
@@ -270,29 +277,13 @@ impl TypeCache {
             Py_DECREF(module);
             return Ok(None);
         }
-        let d = PyModule_GetDict(module);
-        let mut types = [ptr::null_mut::<PyTypeObject>(); 14];
-        for (slot, name) in types.iter_mut().zip(NUMPY_NAMES) {
-            let key = PyUnicode_InternFromString(name.as_ptr());
-            let v = if key.is_null() {
-                Err(PendingPyErr)
-            } else {
-                let v = get_item(d, key);
-                Py_DECREF(key);
-                v
-            };
-            match v {
-                Ok(Some(t)) => *slot = t.cast(),
-                Ok(None) | Err(PendingPyErr) => {
-                    for t in types.iter_mut() {
-                        release(t);
-                    }
-                    Py_DECREF(module);
-                    return v.map(|_| None);
-                }
+        let np = match read_numpy(PyModule_GetDict(module)) {
+            Ok(Some(np)) => np,
+            other => {
+                Py_DECREF(module);
+                return other.map(|_| None);
             }
-        }
-        let np = NumpyTypes::from_all(types);
+        };
         self.np = np;
         self.np_module = module;
         Ok(np.contains(ty).then_some(np))

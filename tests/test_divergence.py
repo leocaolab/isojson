@@ -138,6 +138,16 @@ def test_dv4b_datetime_raising_utcoffset():
     assert str(got.value.__cause__) == str(ref.value)
 
 
+def test_error_message_keeps_a_nul_byte():
+    class NulRaising(dt.tzinfo):
+        def utcoffset(self, _):
+            raise ValueError("bad\x00offset")
+
+    with pytest.raises(TypeError) as got:
+        isojson.dumps(dt.datetime(2026, 1, 1, tzinfo=NulRaising()))
+    assert str(got.value) == "datetime.utcoffset() raised ValueError: bad\x00offset"
+
+
 @pytest.mark.parametrize("offset", [5, dt.timedelta(hours=25)], ids=["int", "25h"])
 def test_dv4b_time_invalid_offset(offset):
     x = dt.time(1, tzinfo=Fixed(offset))

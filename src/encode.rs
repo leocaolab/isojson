@@ -21,7 +21,7 @@ use pyo3_ffi::*;
 use crate::datetime::{fmt_hms, fmt_offset, fmt_ymd, DateTimeParts};
 use crate::decline::{decline_message, decline_note, Decline};
 use crate::float::{small_copy, write_f64};
-use crate::numpy::Outcome;
+use crate::numpy::NumpyError;
 use crate::out::OutputBuffer;
 use crate::types::{DtTypes, TypeCache};
 use crate::*;
@@ -62,9 +62,15 @@ static ESCAPE: [u8; 256] = {
     t
 };
 
+/// Raises `TypeError(msg)`; `msg` may contain NUL bytes. If the message can't
+/// be allocated, the `MemoryError` is raised instead.
 unsafe fn raise_type_error(msg: &str) {
-    let c = std::ffi::CString::new(msg).unwrap_or_else(|_| c"isojson: error".into());
-    PyErr_SetString(PyExc_TypeError, c.as_ptr());
+    let text = PyUnicode_FromStringAndSize(msg.as_ptr().cast(), msg.len() as Py_ssize_t);
+    if text.is_null() {
+        return;
+    }
+    PyErr_SetObject(PyExc_TypeError, text);
+    Py_DECREF(text);
 }
 
 unsafe fn type_name(obj: *mut PyObject) -> String {
@@ -337,15 +343,17 @@ impl Encoder {
             match np {
                 Err(PendingPyErr) => return false,
                 Ok(Some(np)) => {
-                    let outcome = if ty == np.ndarray {
+                    // `np` is not used past this point: writing can run Python
+                    let written = if ty == np.ndarray {
                         Some(crate::numpy::serialize_array(self, obj))
                     } else {
-                        crate::numpy::serialize_scalar(self, obj, np)
+                        np.scalar(ty)
+                            .map(|elem| crate::numpy::serialize_scalar(self, obj, elem))
                     };
-                    match outcome {
-                        Some(Outcome::Written) => return true,
-                        Some(Outcome::Error(PendingPyErr)) => return false,
-                        Some(Outcome::Declined(reason)) => {
+                    match written {
+                        Some(Ok(())) => return true,
+                        Some(Err(NumpyError::Py(PendingPyErr))) => return false,
+                        Some(Err(NumpyError::Declined(reason))) => {
                             return self.call_default_declined(obj, reason)
                         }
                         // an unrecognized numpy type: the ordinary path (FR-8)
@@ -845,8 +853,11 @@ impl Encoder {
 
 /// Copies bytes of `s` from `i` to `dst` until the first byte that needs
 /// escaping (or the end). Returns its index; `dst` is advanced past the copied
-/// bytes. May store up to 15 bytes beyond what it reports as copied, so the
-/// caller must have 16 bytes of slack.
+/// bytes.
+///
+/// # Safety
+/// `dst` must have room for every remaining byte of `s` plus 16 bytes of
+/// slack: it may store up to 15 bytes beyond what it reports as copied.
 #[inline(always)]
 unsafe fn copy_plain(s: &[u8], mut i: usize, dst: &mut *mut u8) -> usize {
     let n = s.len();
