@@ -141,15 +141,21 @@ requirements.
   part of those architectures' baseline, so no runtime detection is needed.
 - **`str` contents are read from the object header, after a self-check.**
   Where CPython 3.14 already holds a string's UTF-8 (compact ASCII, or a
-  cached UTF-8 copy), isojson reads it directly instead of calling
-  `PyUnicode_AsUTF8AndSize`. That layout is not public API. So at import,
-  isojson compares its reading with the API on probe strings and turns the
-  fast path on only if every probe agrees. If a future CPython changes the
-  layout, isojson gets slower but never wrong.
+  cached UTF-8 copy), isojson reads it directly. Any other string is encoded
+  to UTF-8 straight from CPython's own storage (Latin-1, UCS-2 or UCS-4) as
+  it is written, so `dumps` never allocates a UTF-8 copy or leaves one on the
+  caller's string, as `PyUnicode_AsUTF8AndSize` (and orjson) would. That
+  layout is not public API. So at import, isojson compares its reading with
+  the API on probe strings and turns the fast path on only if every probe
+  agrees. If a future CPython changes the layout, isojson gets slower but
+  never wrong.
 - **`loads` parses with simd-json and uses no recursion.** simd-json turns
   the document into a flat tape where every array and object carries its
-  length. isojson builds Python objects from the tape with an explicit
-  stack, so lists are created at their exact size. A document nested 1024
+  length. The tape and simd-json's buffers are kept per thread and reused
+  across calls. isojson builds Python objects from the tape with an explicit
+  stack, so lists are created at their exact size, and builds each non-ASCII
+  `str` directly at its final width, without CPython decoding the UTF-8 a
+  second time. A document nested 1024
   deep is safe even on threads with small C stacks; deeper documents are
   rejected, as in orjson. simd-json never touches a Python object.
 - **Exceptions belong to the interpreter.** `isojson.JSONDecodeError`
@@ -304,7 +310,9 @@ is undefined behaviour there).
   and 3.13's own `_datetime` isn't usable from concurrent strict
   sub-interpreters, so isojson targets 3.14.
 - **Free-threaded builds (3.14t):** the module declares that it needs the
-  GIL, so CPython re-enables it on import (see above).
+  GIL, so CPython re-enables it on import (see above). The header fast path
+  is off there, so `str` is read through the public API and `dumps` is
+  slower on string-heavy documents.
 - **numpy:** `OPT_SERIALIZE_NUMPY` is tested with numpy ≥ 2. isojson reads
   arrays through `__array_struct__` and never imports numpy; it uses the
   numpy the calling interpreter already has in `sys.modules`.
@@ -313,9 +321,11 @@ is undefined behaviour there).
 
 Reproduce with `python bench/bench.py`. Each cell is the median of repeated
 runs. Parallel cells time only the work loop: interpreter or process
-creation and imports happen before timing starts. The single-interpreter
-and datetime/numpy tables are isojson 0.2.0; the parallel tables were
-measured with 0.1.0 (0.2's per-call `dumps` is within 2–7% of 0.1's).
+creation and imports happen before timing starts. On macOS the
+single-interpreter and datetime/numpy tables are isojson 0.3.0 (CPython
+3.14.8, median of three runs); the Linux tables are 0.2.0, and the parallel
+tables were measured with 0.1.0 (0.2's per-call `dumps` is within 2–7% of
+0.1's).
 
 ### macOS arm64: Apple M5 Pro, 18 cores, CPython 3.14.7, orjson 3.12.0
 
@@ -355,45 +365,49 @@ How to read this:
 
 | `dumps` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 49 ns | 43 ns | 567 ns | 1.14× |
-| records ×100 | 18.04 µs | 15.83 µs | 145.72 µs | 1.14× |
-| records ×2000 | 342.46 µs | 279.09 µs | 2.73 ms | 1.23× |
-| floats ×10k | 95.87 µs | 188.74 µs | 2.21 ms | **0.51×** |
-| unicode/escapes ×200 | 12.43 µs | 9.97 µs | 107.87 µs | 1.25× |
+| small (27 B) | 50 ns | 47 ns | 590 ns | 1.08× |
+| records ×100 | 18.61 µs | 17.18 µs | 157.46 µs | 1.08× |
+| records ×2000 | 351.19 µs | 306.42 µs | 2.87 ms | 1.17× |
+| floats ×10k | 100.42 µs | 201.44 µs | 2.34 ms | **0.50×** |
+| unicode/escapes ×200 | 12.57 µs | 11.03 µs | 117.84 µs | 1.19× |
 
 | `loads` | isojson | orjson | json (stdlib) | isojson / orjson |
 |---|---:|---:|---:|---:|
-| small (27 B) | 101 ns | 70 ns | 553 ns | 1.44× |
-| records ×100 | 49.48 µs | 38.35 µs | 101.08 µs | 1.29× |
-| records ×2000 | 1.03 ms | 777.99 µs | 2.02 ms | 1.32× |
-| floats ×10k | 195.54 µs | 162.60 µs | 1.06 ms | 1.20× |
-| unicode/escapes ×200 | 63.99 µs | 42.94 µs | 118.75 µs | 1.49× |
+| small (27 B) | 98 ns | 74 ns | 575 ns | 1.31× |
+| records ×100 | 49.33 µs | 40.63 µs | 107.34 µs | 1.21× |
+| records ×2000 | 1.03 ms | 818.89 µs | 2.16 ms | 1.24× |
+| floats ×10k | 204.39 µs | 179.48 µs | 1.08 ms | 1.15× |
+| unicode/escapes ×200 | 58.05 µs | 47.34 µs | 127.12 µs | 1.25× |
 
 **datetime and numpy** (`dumps`; `python bench/bench.py types`):
 
 | payload | isojson | orjson | isojson / orjson |
 |---|---:|---:|---:|
-| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 182.90 µs | 236.75 µs | **0.77×** |
-| numpy `float64` × 1M | 14.89 ms | 22.45 ms | **0.66×** |
-| numpy `float64` 1000 × 1000 | 14.93 ms | 21.76 ms | **0.69×** |
-| numpy `int64` × 1M | 7.30 ms | 6.77 ms | 1.08× |
-| 10k numpy `float64` scalars | 204.75 µs | 288.92 µs | **0.71×** |
-| 10k numpy `int64` scalars | 115.96 µs | 155.99 µs | **0.74×** |
+| 2,000 records × 3 datetimes (naive, `+08:00`, UTC) | 190.21 µs | 262.32 µs | **0.76×** |
+| numpy `float64` × 1M | 16.21 ms | 23.90 ms | **0.67×** |
+| numpy `float64` 1000 × 1000 | 16.84 ms | 22.94 ms | **0.73×** |
+| numpy `int64` × 1M | 7.96 ms | 7.26 ms | 1.10× |
+| 10k numpy `float64` scalars | 218.92 µs | 314.65 µs | **0.70×** |
+| 10k numpy `int64` scalars | 120.74 µs | 169.37 µs | **0.71×** |
 
 Aware datetimes are faster than orjson's because the offset comes from one
 `tzinfo.utcoffset(dt)` call, checked the way CPython checks it, while orjson
 probes the tzinfo's attributes first. `float64` arrays and scalars share the
 float writer that makes float-heavy documents fast.
 
-In summary, on this machine: `dumps` is 1.1–1.25× orjson's time on plain
+In summary, on this machine: `dumps` is 1.1–1.2× orjson's time on plain
 JSON, about 2× faster on float-heavy documents, and faster on datetimes and
-numpy. `loads` is 1.2–1.5× slower than orjson. Both are 1.5–23× faster than
-stdlib `json`.
+numpy. `loads` is 1.15–1.3× slower than orjson (1.2–1.5× in 0.2). Both are
+1.8–23× faster than stdlib `json`.
 
-The remaining `loads` gap is mostly fixed per-call cost around simd-json:
-the input is copied (simd-json unescapes in place, and `bytes` are
-immutable), and a fresh tape is allocated on every call. Both are next on
-the list.
+The `unicode/escapes` rows understate one change: the benchmark first runs
+orjson on the same objects, which leaves a UTF-8 copy on every string, so
+both libraries take the cached path. On strings with no cached UTF-8,
+`dumps` 0.3 is about 20% faster than 0.2.
+
+What remains of the `loads` gap is mostly per-call cost around simd-json:
+the input is copied, because simd-json unescapes in place and `bytes` are
+immutable.
 
 ### Linux x86_64: AMD Ryzen 7 7840HS, 8 cores / 16 threads, CPython 3.14.7, orjson 3.12.0
 
