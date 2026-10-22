@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Changed
 
@@ -10,6 +10,26 @@
   `sys.set_int_max_str_digits` limit it raises `json.dumps`' `ValueError`.
   `OPT_STRICT_INTEGER` is unchanged. Integers inside 64 bits are written as
   before, through the same code.
+
+### Fixed
+
+- `loads` no longer aborts the process when, while it raises
+  `JSONDecodeError`, the garbage collector runs a `__del__` that calls
+  `loads` again on the same thread.
+- A `TypeError` whose message contains a NUL byte (for example a tzinfo's
+  exception text) keeps its text instead of becoming `isojson: error`.
+
+### Performance
+
+- `loads` reuses simd-json's tape across calls: 5–9% faster on every payload
+  in `bench/bench.py`.
+- `loads` builds a non-ASCII `str` directly at its final width instead of
+  having CPython decode the UTF-8 again: 20% fewer instructions on the
+  unicode payload.
+- `dumps` encodes a non-ASCII `str` straight from CPython's storage. It no
+  longer leaves a UTF-8 copy on each such string it writes (a 100-character
+  CJK string stayed 2,858 bytes instead of growing to 6,259), and writing
+  strings that have no cached UTF-8 is about 20% faster.
 
 ## 0.2.0
 
