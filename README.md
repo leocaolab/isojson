@@ -520,7 +520,7 @@ The suite passes on macOS arm64 and Linux x86_64, both normally and under
 
 ## Status
 
-Version 0.2.0: native `datetime` / `date` / `time` and numpy. The API is
+Version 0.3.0. The API is
 stable (it is orjson's). `UUID`, `Enum` and dataclass support is next.
 
 ## License
