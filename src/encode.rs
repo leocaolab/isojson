@@ -23,6 +23,7 @@ use crate::decline::{decline_message, decline_note, Decline};
 use crate::float::{small_copy, write_f64};
 use crate::numpy::NumpyError;
 use crate::out::OutputBuffer;
+use crate::strfast::StrText;
 use crate::types::{DtTypes, TypeCache};
 use crate::*;
 
@@ -593,16 +594,7 @@ impl Encoder {
     }
 
     unsafe fn str(&mut self, obj: *mut PyObject) -> bool {
-        match crate::strfast::as_utf8(obj) {
-            Some(b) => {
-                write_escaped(&mut self.out, b);
-                true
-            }
-            None => {
-                raise_type_error("str is not valid UTF-8: surrogates not allowed");
-                false
-            }
-        }
+        write_str(&mut self.out, obj)
     }
 
     unsafe fn int(&mut self, obj: *mut PyObject) -> bool {
@@ -726,31 +718,37 @@ impl Encoder {
         true
     }
 
-    unsafe fn key_utf8<'a>(key: *mut PyObject) -> Option<&'a [u8]> {
+    /// Returns the key's text, or `None` with a `TypeError` set if it is not a
+    /// `str` or holds a surrogate.
+    unsafe fn key_text<'a>(key: *mut PyObject) -> Option<StrText<'a>> {
         if PyUnicode_Check(key) == 0 {
             raise_type_error("Dict key must be str");
             return None;
         }
-        let k = crate::strfast::as_utf8(key);
-        if k.is_none() {
-            raise_type_error("str is not valid UTF-8: surrogates not allowed");
+        let text = crate::strfast::text(key);
+        if text.has_surrogate() {
+            raise_type_error(SURROGATES);
+            return None;
         }
-        k
+        Some(text)
     }
 
-    unsafe fn write_key(&mut self, k: &[u8], first: bool) {
+    unsafe fn write_key(&mut self, key: *mut PyObject, first: bool) -> bool {
         if !first {
             self.out.push(b',');
         }
         if self.indent() {
             self.newline_indent(self.depth);
         }
-        write_escaped(&mut self.out, k);
+        if !write_str(&mut self.out, key) {
+            return false;
+        }
         if self.indent() {
             self.out.extend_from_slice(b": ");
         } else {
             self.out.push(b':');
         }
+        true
     }
 
     unsafe fn dict(&mut self, obj: *mut PyObject) -> bool {
@@ -785,17 +783,20 @@ impl Encoder {
         let mut value: *mut PyObject = ptr::null_mut();
         let mut first = true;
         while PyDict_Next(obj, &mut pos, &mut key, &mut value) != 0 {
-            let Some(k) = Self::key_utf8(key) else {
+            if PyUnicode_Check(key) == 0 {
+                raise_type_error("Dict key must be str");
                 return false;
-            };
-            self.write_key(k, first);
+            }
+            if !self.write_key(key, first) {
+                return false;
+            }
             if !self.guard || runs_no_python(value) {
                 if !self.serialize(value) {
                     return false;
                 }
             } else {
                 // Python code may run (FR-13) and mutate this dict; keep the
-                // key (whose UTF-8 we already wrote) and value alive.
+                // key (already written) and value alive.
                 Py_INCREF(key);
                 let ok = self.guarded(value);
                 Py_DECREF(key);
@@ -825,23 +826,29 @@ impl Encoder {
                 Py_DECREF(k);
             }
         };
-        // Validate + fetch UTF-8 for every key first; UTF-8 byte order equals
-        // code point order, which is what Python's str comparison uses.
-        let mut keyed: Vec<(&[u8], *mut PyObject)> = Vec::with_capacity(items.len());
+        // Every key is checked before anything is written. Keys sort by code
+        // point, as Python's str comparison does; UTF-8 byte order is the same
+        // order, so two UTF-8 keys compare as bytes.
+        let mut keyed: Vec<(Option<&[u8]>, *mut PyObject, *mut PyObject)> =
+            Vec::with_capacity(items.len());
         for &(k, v) in &items {
-            match Self::key_utf8(k) {
-                Some(b) => keyed.push((b, v)),
+            match Self::key_text(k) {
+                Some(StrText::Utf8(b)) => keyed.push((Some(b), k, v)),
+                Some(_) => keyed.push((None, k, v)),
                 None => {
                     release(&items);
                     return false;
                 }
             }
         }
-        keyed.sort_by(|a, b| a.0.cmp(b.0));
+        keyed.sort_by(|a, b| match (a.0, b.0) {
+            (Some(x), Some(y)) => x.cmp(y),
+            // exact or subclass `str` keys: compares code points, runs no Python
+            _ => PyUnicode_Compare(a.1, b.1).cmp(&0),
+        });
         let mut ok = true;
-        for (i, &(k, v)) in keyed.iter().enumerate() {
-            self.write_key(k, i == 0);
-            if !self.serialize(v) {
+        for (i, &(_, k, v)) in keyed.iter().enumerate() {
+            if !self.write_key(k, i == 0) || !self.serialize(v) {
                 ok = false;
                 break;
             }
@@ -937,6 +944,106 @@ unsafe fn copy_plain(s: &[u8], mut i: usize, dst: &mut *mut u8) -> usize {
     i
 }
 
+/// Writes the escape for byte `b`, whose `ESCAPE` entry `e` is non-zero, and
+/// returns the end. Writes at most 6 bytes.
+#[inline(always)]
+unsafe fn put_escape(dst: *mut u8, b: u8, e: u8) -> *mut u8 {
+    if e == b'u' {
+        let u = [
+            b'\\',
+            b'u',
+            b'0',
+            b'0',
+            HEX[(b >> 4) as usize],
+            HEX[(b & 0xf) as usize],
+        ];
+        ptr::copy_nonoverlapping(u.as_ptr(), dst, 6);
+        dst.add(6)
+    } else {
+        *dst = b'\\';
+        *dst.add(1) = e;
+        dst.add(2)
+    }
+}
+
+const SURROGATES: &str = "str is not valid UTF-8: surrogates not allowed";
+
+/// Writes the `str` `obj` as a quoted JSON string. Returns `false` with a
+/// `TypeError` set if it holds a surrogate.
+unsafe fn write_str(out: &mut OutputBuffer, obj: *mut PyObject) -> bool {
+    let ok = match crate::strfast::text(obj) {
+        StrText::Utf8(b) => {
+            write_escaped(out, b);
+            true
+        }
+        StrText::Latin1(s) => write_escaped_ucs(out, s),
+        StrText::Ucs2(s) => write_escaped_ucs(out, s),
+        StrText::Ucs4(s) => write_escaped_ucs(out, s),
+    };
+    if !ok {
+        raise_type_error(SURROGATES);
+    }
+    ok
+}
+
+/// Writes code points `s` as a quoted JSON string, encoding UTF-8 on the way
+/// out, so the `str` never needs a UTF-8 copy of its own. Returns `false` on a
+/// surrogate; the output then holds a partial string and must be discarded.
+fn write_escaped_ucs<T: Copy + Into<u32>>(out: &mut OutputBuffer, s: &[T]) -> bool {
+    // the longest UTF-8 a code unit of this width can need
+    let width = match core::mem::size_of::<T>() {
+        1 => 2,
+        2 => 3,
+        _ => 4,
+    };
+    let n = s.len();
+    out.reserve(n * width + 2);
+    unsafe {
+        let mut dst = out.as_mut_ptr().add(out.len());
+        *dst = b'"';
+        dst = dst.add(1);
+        for (i, &unit) in s.iter().enumerate() {
+            let c: u32 = unit.into();
+            if c < 0x80 {
+                let e = ESCAPE[c as usize];
+                if e == 0 {
+                    *dst = c as u8;
+                    dst = dst.add(1);
+                } else {
+                    // an escape takes up to 6 bytes, more than this unit's share
+                    let written = dst.offset_from(out.as_mut_ptr()) as usize;
+                    out.set_len(written);
+                    out.reserve((n - i) * width + 6 + 1);
+                    dst = put_escape(out.as_mut_ptr().add(written), c as u8, e);
+                }
+            } else if c < 0x800 {
+                *dst = 0xC0 | (c >> 6) as u8;
+                *dst.add(1) = 0x80 | (c & 0x3F) as u8;
+                dst = dst.add(2);
+            } else if c < 0x10000 {
+                if (0xD800..=0xDFFF).contains(&c) {
+                    return false;
+                }
+                *dst = 0xE0 | (c >> 12) as u8;
+                *dst.add(1) = 0x80 | ((c >> 6) & 0x3F) as u8;
+                *dst.add(2) = 0x80 | (c & 0x3F) as u8;
+                dst = dst.add(3);
+            } else {
+                *dst = 0xF0 | (c >> 18) as u8;
+                *dst.add(1) = 0x80 | ((c >> 12) & 0x3F) as u8;
+                *dst.add(2) = 0x80 | ((c >> 6) & 0x3F) as u8;
+                *dst.add(3) = 0x80 | (c & 0x3F) as u8;
+                dst = dst.add(4);
+            }
+        }
+        *dst = b'"';
+        dst = dst.add(1);
+        let written = dst.offset_from(out.as_mut_ptr()) as usize;
+        out.set_len(written);
+    }
+    true
+}
+
 #[inline]
 fn write_escaped(out: &mut OutputBuffer, s: &[u8]) {
     let n = s.len();
@@ -949,27 +1056,7 @@ fn write_escaped(out: &mut OutputBuffer, s: &[u8]) {
         let mut i = copy_plain(s, 0, &mut dst);
         while i < n {
             let b = *s.get_unchecked(i);
-            let e = ESCAPE[b as usize];
-            if e == b'u' {
-                core::ptr::copy_nonoverlapping(
-                    [
-                        b'\\',
-                        b'u',
-                        b'0',
-                        b'0',
-                        HEX[(b >> 4) as usize],
-                        HEX[(b & 0xf) as usize],
-                    ]
-                    .as_ptr(),
-                    dst,
-                    6,
-                );
-                dst = dst.add(6);
-            } else {
-                *dst = b'\\';
-                *dst.add(1) = e;
-                dst = dst.add(2);
-            }
+            dst = put_escape(dst, b, ESCAPE[b as usize]);
             i += 1;
             // Escapes grow the output: make sure the rest still fits (plus
             // one more escape, the closing quote, and the slack).
