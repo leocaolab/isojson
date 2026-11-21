@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Built against simd-json 0.19.0 from crates.io instead of our fork: the
+  lone-high-surrogate fix the fork carried (`"\ud800"` parsed as `"\0"`
+  instead of an error) is upstream since 0.19.0 (simd-lite/simd-json#482).
+
 ## 0.3.0
 
 ### Changed
